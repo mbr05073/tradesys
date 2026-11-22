@@ -465,6 +465,29 @@ def hour_text(ctx, why, l, bad, ts, cfg):
 
 
 # ── الحلقة ─────────────────────────────────────────────────────────────
+_NEWS_CACHE = {"ts": 0, "events": []}
+
+def news_block(ts, before_min=30, after_min=20):
+    """يمنع الإشارات حول أخبار USD عالية التأثير."""
+    try:
+        if ts - _NEWS_CACHE["ts"] > 21600:
+            r = httpx.get("https://nfs.faireconomy.media/ff_calendar_thisweek.json", timeout=10)
+            if r.status_code == 200:
+                evs = []
+                for e in r.json():
+                    if e.get("country") == "USD" and e.get("impact") == "High":
+                        dt = datetime.fromisoformat(e["date"])
+                        evs.append((int(dt.timestamp()), e.get("title", "خبر USD")))
+                _NEWS_CACHE["events"] = evs
+                _NEWS_CACHE["ts"] = ts
+        for ev_ts, title in _NEWS_CACHE["events"]:
+            if -before_min * 60 <= (ts - ev_ts) <= after_min * 60:
+                t_str = datetime.fromtimestamp(ev_ts, RIY).strftime("%H:%M")
+                return f"فلتر الأخبار: {title} ({t_str} الرياض)"
+    except Exception:
+        pass
+    return None
+
 def scan(c, cd, ts, inst, cfg):
     if not is_open(cfg, ts):
         return False, None, "السوق مغلق", []
@@ -479,7 +502,7 @@ def scan(c, cd, ts, inst, cfg):
     if bad:
         return False, None, "، ".join(bad), bad
     l = ledger(c, ts, inst)
-    blk = risk_block(l, cfg["max"])
+    blk = risk_block(l, cfg["max"]) or news_block(ts)
     s, why = propose(bars)
     ctx = s
     if not s:
@@ -504,10 +527,31 @@ def scan(c, cd, ts, inst, cfg):
     return True, ctx, None, bad
 
 
+def eod_text(c, ts):
+    day = day_str(ts)
+    lines = [f"📊 تقرير نهاية اليوم — {day}", ""]
+    tot_r, tot_n = 0.0, 0
+    for inst, cfg in INSTRUMENTS.items():
+        rows = c.execute("SELECT status, r FROM sig WHERE day=? AND inst=?", (day, inst)).fetchall()
+        n = len(rows)
+        r_sum = sum(x[1] for x in rows)
+        wins = sum(1 for x in rows if x[1] > 0)
+        losses = sum(1 for x in rows if x[1] < 0)
+        pend = sum(1 for x in rows if x[0] == "pending")
+        tot_r += r_sum
+        tot_n += n
+        lines.append(
+            f"• {cfg['name']}: {n}/{cfg['max']} صفقات | ربح {wins} · خسارة {losses}"
+            + (f" · معلقة {pend}" if pend else "")
+            + f" | الصافي {r_sum:+.2f}R"
+        )
+    lines += ["", f"الإجمالي اليومي: {tot_n} إشارات · {tot_r:+.2f}R"]
+    return "\n".join(lines)
+
 def main():
     c = db(); cd = CD()
     say("✅ المحرّك يعمل — الذهب والبتكوين. فحص كل 5 دقائق، تقرير كل ساعة.")
-    last_scan = 0; last_hour = -1
+    last_scan = 0; last_hour = -1; last_eod = ""
     sent = {k: False for k in INSTRUMENTS}
     state = {k: (None, "لم يبدأ الفحص", []) for k in INSTRUMENTS}
     last_bars = {}
@@ -552,6 +596,11 @@ def main():
                         say(msg)
                 last_hour = hr
                 sent = {k: False for k in INSTRUMENTS}
+            now_dt = datetime.fromtimestamp(ts, RIY)
+            today_s = day_str(ts)
+            if now_dt.hour == 23 and now_dt.minute >= 55 and last_eod != today_s:
+                say(eod_text(c, ts))
+                last_eod = today_s
         except Exception:
             try:
                 say("خطأ عام:\n" + traceback.format_exc()[-400:])
@@ -607,5 +656,7 @@ if __name__ == "__main__":
         b, t = cd.bars()
         print(f"تحقق: {len(b)} شمعة، آخر إغلاق {b[-1]['c'] if b else '—'}")
         say("✅ تم تسجيل جهاز ClusterDelta — الذهب جاهز.")
+    elif len(sys.argv) > 1 and sys.argv[1] == "eod":
+        c = db(); txt = eod_text(c, int(time.time())); say(txt); print(txt)
     else:
         main()
