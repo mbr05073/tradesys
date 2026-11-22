@@ -42,7 +42,7 @@ MAX_AGE     = 900          # عمر آخر شمعة خمسية (ثانية)
 SCAN        = 300
 RIY = timezone(timedelta(hours=3))
 GROQ_KEY   = os.getenv("GROQ_KEY", "")
-GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
 
 # ── تليجرام ────────────────────────────────────────────────────────────
@@ -139,12 +139,12 @@ class CD:
         """المستويات [تكّات, Ask=شراء, Bid=بيع]؛ السعر = التكّات × tickSize."""
         to = int(time.time())
         r = self.h.get(f"{BASE}/footprint.php",
-                       params={"symbol": SYMBOL, "tf": TF,
+                       params={"symbol": INSTRUMENTS["GC"]["sym"], "tf": TF,
                                "from": to - minutes * 60, "to": to})
         if r.status_code == 401:
             self.ensure()
             r = self.h.get(f"{BASE}/footprint.php",
-                           params={"symbol": SYMBOL, "tf": TF,
+                           params={"symbol": INSTRUMENTS["GC"]["sym"], "tf": TF,
                                    "from": to - minutes * 60, "to": to})
         r.raise_for_status()
         j = r.json()
