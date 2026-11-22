@@ -41,6 +41,8 @@ MAX_CONSEC  = 2
 MAX_AGE     = 900          # عمر آخر شمعة خمسية (ثانية)
 SCAN        = 300
 RIY = timezone(timedelta(hours=3))
+GROQ_KEY   = os.getenv("GROQ_KEY", "")
+GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 
 # ── تليجرام ────────────────────────────────────────────────────────────
@@ -159,6 +161,62 @@ class CD:
                         "buy": buy, "sell": sell, "lv": lv})
         out.sort(key=lambda x: x["ts"])
         return out, tick
+
+
+# ── تحليل عميق عبر نموذج لغوي ──────────────────────────────────────────
+def worth_analysis(bars, sig):
+    """ترشيح قبل استدعاء النموذج: لا ننفق نداءً على وضع بلا دلالة."""
+    if sig:
+        return True
+    w = bars[-WIN:]
+    pr = profile(w)
+    if not pr:
+        return False
+    px = w[-1]["c"]; r = rng(w)
+    near = min(abs(px - pr["vah"]), abs(px - pr["val"])) <= r
+    return near or abs(delta_ratio(w[-1])) >= 0.15
+
+
+def analyze(cfg, bars, sig, why):
+    """قراءة سياق من النموذج. يُرجع نصاً أو None.
+
+    النموذج يشرح ولا يقرر: بوابة المخاطرة والقواعد في الكود، وأي اقتراح
+    يخالفها يُتجاهل. هذا متعمّد — الانضباط هو ما أثبت الاختبار أنه الحافة.
+    """
+    if not GROQ_KEY:
+        return None
+    w = bars[-WIN:]
+    pr = profile(w)
+    rows = [f"{datetime.fromtimestamp(b['ts'], RIY).strftime('%H:%M')} "
+            f"o{b['o']:.1f} h{b['h']:.1f} l{b['l']:.1f} c{b['c']:.1f} "
+            f"د{delta_ratio(b)*100:+.0f}%" for b in w[-14:]]
+    state = (f"الأداة: {cfg['name']}\n"
+             f"السعر {w[-1]['c']:,.1f} · المدى {rng(w):,.2f}\n"
+             f"البروفايل: VAL {pr['val']:,.1f} · POC {pr['poc']:,.1f} · VAH {pr['vah']:,.1f}\n"
+             f"آخر 14 شمعة (5 دقائق):\n" + "\n".join(rows) + "\n\n"
+             + (f"إشارة: {sig['side']} دخول {sig['entry']:,.1f} ستوب {sig['stop']:,.1f}"
+                f" هدف {sig['targets'][0]:,.1f} R:R 1:{sig['rr']}"
+                if sig else f"لا إشارة. السبب: {why}"))
+    prompt = (
+        "أنت محلل تدفق أوامر. اقرأ الحالة وأجب بالعربية في 5 أسطر كحد أقصى:\n"
+        "1) ما يقوله التدفق الآن (اتجاه الضغط وهل يتسارع أم يخفّ)\n"
+        "2) أهم مستوى يتحكم بالحركة ولماذا\n"
+        "3) ما يُضعف هذه القراءة\n"
+        "4) ما تنتظره لتأكيدها أو نفيها\n"
+        "لا توصِ بدخول ولا تذكر أهدافاً — القرار محكوم بقواعد ثابتة خارج نطاقك.\n"
+        "لا تخترع أرقاماً غير المعطاة.\n\n" + state)
+    try:
+        r = httpx.post("https://api.groq.com/openai/v1/chat/completions",
+                       headers={"Authorization": f"Bearer {GROQ_KEY}"},
+                       json={"model": GROQ_MODEL, "temperature": 0.3,
+                             "max_tokens": 400,
+                             "messages": [{"role": "user", "content": prompt}]},
+                       timeout=30)
+        if r.status_code != 200:
+            return None
+        return r.json()["choices"][0]["message"]["content"].strip()[:900]
+    except Exception:
+        return None
 
 
 # ── مصدر OKX للبتكوين ──────────────────────────────────────────────────
@@ -415,6 +473,7 @@ def scan(c, cd, ts, inst, cfg):
         bars, _ = cd.bars()
     else:
         bars = okx_bars(cfg["sym"], cfg["bucket"])
+    cfg["_bars"] = bars
     update(c, inst, bars)
     bad = integrity(bars, ts)
     if bad:
@@ -437,7 +496,11 @@ def scan(c, cd, ts, inst, cfg):
               (ts, day_str(ts), inst, s["side"], s["entry"], s["stop"],
                s["targets"][0], s["targets"][1], s["targets"][2], s["rr"]))
     c.commit()
-    say(sig_text(s, l, ts, cfg))
+    msg = sig_text(s, l, ts, cfg)
+    a = analyze(cfg, bars, s, None)
+    if a:
+        msg += "\n\n🧠 قراءة التدفق:\n" + a
+    say(msg)
     return True, ctx, None, bad
 
 
@@ -447,6 +510,7 @@ def main():
     last_scan = 0; last_hour = -1
     sent = {k: False for k in INSTRUMENTS}
     state = {k: (None, "لم يبدأ الفحص", []) for k in INSTRUMENTS}
+    last_bars = {}
     errs = {}
     while True:
         try:
@@ -456,6 +520,8 @@ def main():
                 for inst, cfg in INSTRUMENTS.items():
                     try:
                         ok, ctx, why, bad = scan(c, cd, ts, inst, cfg)
+                        if cfg.get("_bars") is not None:
+                            last_bars[inst] = cfg.pop("_bars")
                         state[inst] = (ctx, why, bad)
                         if ok:
                             sent[inst] = True
@@ -476,8 +542,14 @@ def main():
                         if sent[inst]:
                             continue
                         ctx, why, bad = state[inst]
-                        say(hour_text(ctx, why or "—", ledger(c, ts, inst),
-                                      bad, ts, cfg))
+                        msg = hour_text(ctx, why or "—", ledger(c, ts, inst),
+                                        bad, ts, cfg)
+                        bl = last_bars.get(inst)
+                        if bl and worth_analysis(bl, None):
+                            a = analyze(cfg, bl, None, why)
+                            if a:
+                                msg += "\n\n🧠 قراءة التدفق:\n" + a
+                        say(msg)
                 last_hour = hr
                 sent = {k: False for k in INSTRUMENTS}
         except Exception:
@@ -513,7 +585,10 @@ if __name__ == "__main__":
                               f"إشارة {sig['side']} دخول {sig['entry']:,.1f} ستوب {sig['stop']:,.1f}"
                               f" R:R 1:{sig['rr']}" if sig else (blk or why)),
                           f"  اليوم: {led['sent']}/{cfg['max']} · {led['r']:+.2f}R", ""]
-                print(lines[-6]); print(lines[-2])
+                a = analyze(cfg, bars, sig, blk or why)
+                if a:
+                    lines += ["🧠 قراءة التدفق:", a, ""]
+                print(lines[-6] if not a else cfg["name"]); print("تم")
             except Exception as e:
                 lines += [f"{cfg['name']}: خطأ — {type(e).__name__}: {e}"[:200], ""]
                 print(cfg["name"], "خطأ:", type(e).__name__, str(e)[:120])
