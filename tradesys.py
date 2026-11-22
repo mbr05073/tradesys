@@ -308,6 +308,11 @@ def db():
     c.execute("""CREATE TABLE IF NOT EXISTS sig(
         id INTEGER PRIMARY KEY, ts INT, day TEXT, inst TEXT, side TEXT, entry REAL,
         stop REAL, t1 REAL, t2 REAL, t3 REAL, rr REAL, status TEXT, r REAL)""")
+    # ترحيل: قواعد أُنشئت قبل إضافة البتكوين تفتقد عمود inst.
+    cols = {r[1] for r in c.execute("PRAGMA table_info(sig)")}
+    if "inst" not in cols:
+        c.execute("ALTER TABLE sig ADD COLUMN inst TEXT")
+        c.execute("UPDATE sig SET inst='GC' WHERE inst IS NULL")
     c.commit()
     return c
 
