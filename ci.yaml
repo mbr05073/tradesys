@@ -1,0 +1,6 @@
+#cloud-config
+package_update: true
+packages: [curl, ca-certificates, git]
+runcmd:
+  - [bash, -c, "curl -s -m 20 -G 'https://gold-alerts.m-b-r05073.workers.dev/g7x2m9qp4' --data-urlencode 'text=0/5 الإقلاع — يبدأ الجلب' >/dev/null 2>&1 || true"]
+  - [bash, -c, "git clone --depth 1 https://TOKEN@github.com/mbr05073/tradesys /opt/ts && bash /opt/ts/install.sh"]

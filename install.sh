@@ -1,5 +1,5 @@
 #!/bin/bash
-R="https://gold-alerts.m-b-r05073.workers.dev/g7x2m9qp4"
+R="$1"
 say(){ curl -s -m 25 -G "$R" --data-urlencode "text=$1" >/dev/null 2>&1||true; }
 st(){ [ "$2" = 0 ] && say "OK $1" || say "FAIL $1 ($2)
 $3"; }
