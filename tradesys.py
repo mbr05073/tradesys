@@ -489,7 +489,37 @@ def main():
 
 
 if __name__ == "__main__":
-    if len(sys.argv) > 1 and sys.argv[1] == "register":
+    if len(sys.argv) > 1 and sys.argv[1] == "check":
+        # فحص فوري لكل أداة: يطبع القرار الحيّ ويرسله للقناة.
+        c = db(); cd = CD(); ts = int(time.time())
+        lines = [f"🔎 فحص فوري — {now_riy(ts)} الرياض", ""]
+        for inst, cfg in INSTRUMENTS.items():
+            try:
+                if not is_open(cfg, ts):
+                    lines += [f"{cfg['name']}: السوق مغلق", ""]
+                    print(cfg["name"], "— السوق مغلق"); continue
+                bars = cd.bars()[0] if cfg["src"] == "cd" else okx_bars(cfg["sym"], cfg["bucket"])
+                bad = integrity(bars, ts)
+                sig, why = propose(bars)
+                w = bars[-WIN:]; pr = profile(w)
+                led = ledger(c, ts, inst)
+                blk = risk_block(led, cfg["max"])
+                lines += [f"{cfg['name']}  ({len(bars)} شمعة)",
+                          f"  السعر {w[-1]['c']:,.1f} · دلتا {delta_ratio(w[-1])*100:+.1f}%"
+                          f" · مدى {rng(w):,.2f}",
+                          f"  VAL {pr['val']:,.1f} · POC {pr['poc']:,.1f} · VAH {pr['vah']:,.1f}",
+                          f"  سلامة: {'سليمة' if not bad else ' / '.join(bad)}",
+                          f"  القرار: " + (
+                              f"إشارة {sig['side']} دخول {sig['entry']:,.1f} ستوب {sig['stop']:,.1f}"
+                              f" R:R 1:{sig['rr']}" if sig else (blk or why)),
+                          f"  اليوم: {led['sent']}/{cfg['max']} · {led['r']:+.2f}R", ""]
+                print(lines[-6]); print(lines[-2])
+            except Exception as e:
+                lines += [f"{cfg['name']}: خطأ — {type(e).__name__}: {e}"[:200], ""]
+                print(cfg["name"], "خطأ:", type(e).__name__, str(e)[:120])
+        say("\n".join(lines))
+        print("أُرسل للقناة.")
+    elif len(sys.argv) > 1 and sys.argv[1] == "register":
         import getpass
         cd = CD()
         st = cd.status()
