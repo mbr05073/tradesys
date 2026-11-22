@@ -21,8 +21,16 @@ BASE   = "https://orderflow.clusterdelta.com/api"
 RELAY  = os.getenv("TS_RELAY", "")
 DEV    = os.getenv("CD_DEVICE_FILE", "/var/lib/tradesys/device.json")
 DB     = os.getenv("TS_DB", "/var/lib/tradesys/ts.db")
-SYMBOL = os.getenv("TS_SYMBOL", "gc")
 TF     = 5                 # دقائق لكل شمعة
+OKX    = "https://www.okx.com/api/v5"
+
+# أداتان، مصدران. ClusterDelta عقود آجلة فقط ولا تضمّ البتكوين.
+INSTRUMENTS = {
+    "GC": {"src": "cd", "sym": "gc", "bucket": 0.1, "max": 4,
+           "hours": "gold", "name": "الذهب GC"},
+    "BTC": {"src": "okx", "sym": "BTC-USDT-SWAP", "bucket": 10.0, "max": 5,
+            "hours": "24/7", "name": "البتكوين"},
+}
 WIN    = 36                # نافذة القرار: 3 ساعات (نفس نافذة الاختبار)
 DELTA_MIN   = 0.18         # بوابة الدلتا
 RR_MIN      = 2.0
@@ -153,6 +161,44 @@ class CD:
         return out, tick
 
 
+# ── مصدر OKX للبتكوين ──────────────────────────────────────────────────
+def okx_bars(inst_id, bucket=10.0, limit=120):
+    """شمعات 5 دقائق + دلتا المشترين/البائعين من taker-volume.
+
+    حدّ معرفي يجب ذكره: OKX لا تعطي فوتبرنت لكل مستوى سعر. الدلتا حقيقية
+    لكل خمس دقائق، أما توزيعها على المستويات فتقريبي (متساوٍ على مدى
+    الشمعة). فالبروفايل وVAH/VAL تقريبية، والامتصاص والاختلال لا معنى لهما
+    هنا. لا ندّعي غير ذلك في التقارير.
+    """
+    h = httpx.Client(timeout=25, headers={"User-Agent": "tradesys/2.0"})
+    c = h.get(f"{OKX}/market/candles",
+              params={"instId": inst_id, "bar": "5m", "limit": limit}).json()
+    t = h.get(f"{OKX}/rubik/stat/taker-volume",
+              params={"ccy": inst_id.split("-")[0], "instType": "CONTRACTS",
+                      "period": "5m", "limit": limit}).json()
+    if c.get("code") not in ("0", 0) or t.get("code") not in ("0", 0):
+        raise RuntimeError(f"OKX: {c.get('msg') or t.get('msg')}")
+    taker = {int(r[0]) // 1000: (float(r[1]), float(r[2])) for r in t.get("data", [])}
+    out = []
+    for r in c.get("data", []):
+        ts = int(r[0]) // 1000
+        if len(r) > 8 and r[8] == "0":      # شمعة قيد التكوين — تُسقط
+            continue
+        if ts not in taker:
+            continue
+        sell, buy = taker[ts]
+        o, hi, lo, cl = float(r[1]), float(r[2]), float(r[3]), float(r[4])
+        b0 = math.floor(lo / bucket) * bucket
+        b1 = math.floor(hi / bucket) * bucket
+        n = int(round((b1 - b0) / bucket)) + 1
+        lv = {round(b0 + i * bucket, 6): (buy / n, sell / n) for i in range(n)}
+        out.append({"ts": ts, "o": o, "h": hi, "l": lo, "c": cl,
+                    "v": buy + sell, "d": buy - sell,
+                    "buy": buy, "sell": sell, "lv": lv})
+    out.sort(key=lambda x: x["ts"])
+    return out
+
+
 # ── مقاييس ─────────────────────────────────────────────────────────────
 def profile(bars, pct=0.70):
     tot = {}
@@ -201,6 +247,10 @@ def integrity(bars, now):
     if n:
         bad.append(f"فوتبرنت غير متسق في {n} شمعة")
     return bad
+
+
+def is_open(cfg, now=None):
+    return gold_open(now) if cfg["hours"] == "gold" else True
 
 
 def gold_open(now=None):
@@ -256,7 +306,7 @@ def db():
     os.makedirs(os.path.dirname(DB), exist_ok=True)
     c = sqlite3.connect(DB)
     c.execute("""CREATE TABLE IF NOT EXISTS sig(
-        id INTEGER PRIMARY KEY, ts INT, day TEXT, side TEXT, entry REAL,
+        id INTEGER PRIMARY KEY, ts INT, day TEXT, inst TEXT, side TEXT, entry REAL,
         stop REAL, t1 REAL, t2 REAL, t3 REAL, rr REAL, status TEXT, r REAL)""")
     c.commit()
     return c
@@ -266,9 +316,10 @@ def day_str(ts):
     return datetime.fromtimestamp(ts, RIY).strftime("%Y-%m-%d")
 
 
-def ledger(c, ts):
+def ledger(c, ts, inst):
     d = day_str(ts)
-    rows = c.execute("SELECT status,r FROM sig WHERE day=? ORDER BY ts", (d,)).fetchall()
+    rows = c.execute("SELECT status,r FROM sig WHERE day=? AND inst=? ORDER BY ts",
+                     (d, inst)).fetchall()
     sent = len(rows)
     done = [x for x in rows if x[0] in ("target", "stop")]
     rr = sum(x[1] or 0 for x in done)
@@ -279,18 +330,19 @@ def ledger(c, ts):
     return {"sent": sent, "r": rr, "consec": cs, "open": openp}
 
 
-def risk_block(l):
-    if l["open"]:            return "صفقة قائمة — لا تكديس"
-    if l["sent"] >= MAX_TRADES: return f"بلغنا {MAX_TRADES} صفقات اليوم"
+def risk_block(l, mx):
+    if l["open"]:       return "صفقة قائمة — لا تكديس"
+    if l["sent"] >= mx: return f"بلغنا {mx} صفقات اليوم"
     if l["r"] <= LOSS_CAP:   return f"سقف الخسارة اليومي {LOSS_CAP}R"
     if l["r"] >= DAY_TARGET: return f"تحقق هدف اليوم +{DAY_TARGET}R"
     if l["consec"] >= MAX_CONSEC: return "خسارتان متتاليتان — توقف"
     return None
 
 
-def update(c, bars):
+def update(c, inst, bars):
     rows = c.execute("SELECT id,ts,side,entry,stop,t1,status FROM sig "
-                     "WHERE status IN ('pending','active')").fetchall()
+                     "WHERE inst=? AND status IN ('pending','active')",
+                     (inst,)).fetchall()
     for sid, ts, side, entry, stop, t1, st in rows:
         nb = [b for b in bars if b["ts"] > ts]
         for b in nb:
@@ -318,9 +370,9 @@ def now_riy(ts):
     return datetime.fromtimestamp(ts, RIY).strftime("%H:%M")
 
 
-def sig_text(s, l, ts):
+def sig_text(s, l, ts, cfg):
     ar = "شراء" if s["side"] == "buy" else "بيع"
-    return (f"🟢 إشارة {ar} — الذهب GC\n{now_riy(ts)} الرياض\n\n"
+    return (f"🟢 إشارة {ar} — {cfg['name']}\n{now_riy(ts)} الرياض\n\n"
             f"الدخول: {s['entry']:,.1f} (ارتداد على المستوى المكسور)\n"
             f"الستوب: {s['stop']:,.1f}  ({s['risk']} نقطة)\n"
             f"الأهداف: {s['targets'][0]:,.1f} · {s['targets'][1]:,.1f} · {s['targets'][2]:,.1f}\n"
@@ -329,12 +381,12 @@ def sig_text(s, l, ts):
             f"بإغلاق، دلتا {s['delta']*100:+.1f}%\n"
             f"البروفايل: VAL {s['val']:,.1f} · POC {s['poc']:,.1f} · VAH {s['vah']:,.1f}\n"
             f"المدى (8 شمعات): {s['range']}\n\n"
-            f"اليوم: {l['sent']+1}/{MAX_TRADES} · المحقق {l['r']:+.2f}R\n"
+            f"اليوم: {l['sent']+1}/{cfg['max']} · المحقق {l['r']:+.2f}R\n"
             f"الستوب إلزامي. النظام لا ينفّذ — القرار لك.")
 
 
-def hour_text(ctx, why, l, bad, ts):
-    x = [f"تقرير الساعة — الذهب GC", f"{now_riy(ts)} الرياض", ""]
+def hour_text(ctx, why, l, bad, ts, cfg):
+    x = [f"تقرير الساعة — {cfg['name']}", f"{now_riy(ts)} الرياض", ""]
     if ctx:
         x += [f"السعر: {ctx['price']:,.1f}",
               f"الدلتا: {ctx['delta']*100:+.1f}%",
@@ -342,74 +394,92 @@ def hour_text(ctx, why, l, bad, ts):
               f"POC {ctx['poc']:,.1f} | VAH {ctx['vah']:,.1f} | VAL {ctx['val']:,.1f}"]
     x += ["", f"لا صفقة: {why}"]
     x += ["سلامة البيانات: " + ("سليمة" if not bad else " / ".join(bad))]
-    x += ["", f"اليوم: {l['sent']}/{MAX_TRADES} صفقات · المحقق {l['r']:+.2f}R"]
-    x += ["ملاحظة: لا سعر مرجعي مستقل لعقد GC — التحقق داخلي فقط",
+    x += ["", f"اليوم: {l['sent']}/{cfg['max']} صفقات · المحقق {l['r']:+.2f}R"]
+    x += ["ملاحظة: لا سعر مرجعي مستقل — التحقق داخلي فقط" if cfg["src"] == "cd"
+          else "ملاحظة: دلتا OKX حقيقية لكل 5 دقائق، وتوزيعها على المستويات تقريبي",
           "فلتر الأخبار: معطّل — لا تغذية أخبار مُعدّة"]
     return "\n".join(x)
 
 
 # ── الحلقة ─────────────────────────────────────────────────────────────
-def scan(c, cd, ts):
-    if not gold_open(ts):
+def scan(c, cd, ts, inst, cfg):
+    if not is_open(cfg, ts):
         return False, None, "السوق مغلق", []
-    cd.ensure()
-    bars, tick = cd.bars()
-    update(c, bars)
+    if cfg["src"] == "cd":
+        cd.ensure()
+        bars, _ = cd.bars()
+    else:
+        bars = okx_bars(cfg["sym"], cfg["bucket"])
+    update(c, inst, bars)
     bad = integrity(bars, ts)
     if bad:
         return False, None, "، ".join(bad), bad
-    l = ledger(c, ts)
-    blk = risk_block(l)
+    l = ledger(c, ts, inst)
+    blk = risk_block(l, cfg["max"])
     s, why = propose(bars)
-    ctx = s if s else None
+    ctx = s
     if not s:
-        if not ctx:
-            w = bars[-WIN:]
-            pr = profile(w)
-            if pr:
-                ctx = {"price": w[-1]["c"], "delta": delta_ratio(w[-1]),
-                       "range": round(rng(w), 2), **pr}
+        w = bars[-WIN:]
+        pr = profile(w)
+        if pr:
+            ctx = {"price": w[-1]["c"], "delta": delta_ratio(w[-1]),
+                   "range": round(rng(w), 2), **pr}
         return False, ctx, why, bad
     if blk:
         return False, ctx, blk, bad
-    c.execute("INSERT INTO sig(ts,day,side,entry,stop,t1,t2,t3,rr,status,r) "
-              "VALUES(?,?,?,?,?,?,?,?,?, 'pending', 0)",
-              (ts, day_str(ts), s["side"], s["entry"], s["stop"],
+    c.execute("INSERT INTO sig(ts,day,inst,side,entry,stop,t1,t2,t3,rr,status,r) "
+              "VALUES(?,?,?,?,?,?,?,?,?,?, 'pending', 0)",
+              (ts, day_str(ts), inst, s["side"], s["entry"], s["stop"],
                s["targets"][0], s["targets"][1], s["targets"][2], s["rr"]))
     c.commit()
-    say(sig_text(s, l, ts))
+    say(sig_text(s, l, ts, cfg))
     return True, ctx, None, bad
 
 
 def main():
     c = db(); cd = CD()
-    say("✅ محرّك الذهب يعمل — فحص كل 5 دقائق، تقرير كل ساعة إن لم تُرسل إشارة.")
-    last_scan = 0; last_hour = -1; sent_hour = False; last_err = ""; err_at = 0
-    state = (None, "لم يبدأ الفحص بعد", [])
+    say("✅ المحرّك يعمل — الذهب والبتكوين. فحص كل 5 دقائق، تقرير كل ساعة.")
+    last_scan = 0; last_hour = -1
+    sent = {k: False for k in INSTRUMENTS}
+    state = {k: (None, "لم يبدأ الفحص", []) for k in INSTRUMENTS}
+    errs = {}
     while True:
         try:
             ts = int(time.time()); hr = ts // 3600
             if ts - last_scan >= SCAN:
                 last_scan = ts - (ts % SCAN)
-                ok, ctx, why, bad = scan(c, cd, ts)
-                state = (ctx, why, bad)
-                if ok:
-                    sent_hour = True
+                for inst, cfg in INSTRUMENTS.items():
+                    try:
+                        ok, ctx, why, bad = scan(c, cd, ts, inst, cfg)
+                        state[inst] = (ctx, why, bad)
+                        if ok:
+                            sent[inst] = True
+                    except Exception as e:
+                        k = f"{inst}:{type(e).__name__}:{e}"[:160]
+                        if errs.get(k, 0) < ts - 3600:
+                            errs[k] = ts
+                            if "ClusterDelta" in str(e):
+                                say("⚠️ لا جلسة ClusterDelta — الذهب متوقف.\n"
+                                    "sudo -u tradesys /opt/ts/venv/bin/python "
+                                    "/opt/ts/tradesys.py register")
+                            else:
+                                say(f"خطأ في {cfg['name']}:\n"
+                                    + traceback.format_exc()[-400:])
             if hr != last_hour and ts % 3600 < 120:
-                if last_hour != -1 and not sent_hour:
-                    ctx, why, bad = state
-                    say(hour_text(ctx, why or "—", ledger(c, ts), bad, ts))
-                last_hour = hr; sent_hour = False
-        except Exception as e:
-            k = f"{type(e).__name__}:{e}"[:160]
-            ts2 = int(time.time())
-            if k != last_err or ts2 - err_at > 3600:
-                last_err, err_at = k, ts2
-                if "ClusterDelta" in str(e):
-                    say("⚠️ لا جلسة ClusterDelta — الذهب متوقف.\nسجّل الجهاز:\n"
-                        "sudo -u tradesys /opt/ts/venv/bin/python /opt/ts/tradesys.py register")
-                else:
-                    say("خطأ:\n" + traceback.format_exc()[-500:])
+                if last_hour != -1:
+                    for inst, cfg in INSTRUMENTS.items():
+                        if sent[inst]:
+                            continue
+                        ctx, why, bad = state[inst]
+                        say(hour_text(ctx, why or "—", ledger(c, ts, inst),
+                                      bad, ts, cfg))
+                last_hour = hr
+                sent = {k: False for k in INSTRUMENTS}
+        except Exception:
+            try:
+                say("خطأ عام:\n" + traceback.format_exc()[-400:])
+            except Exception:
+                pass
         time.sleep(30)
 
 
