@@ -115,7 +115,7 @@ class CD:
             r = self.h.post(f"{BASE}/auth.php", params={"action": "resume"},
                             data={"id": self.d["id"], "nonce": n, "sig": sig,
                                   "secret": self.d["secret"]})
-            if r.status_code == 401:
+            if r.status_code in (401, 403):
                 return None
             if r.status_code == 409:
                 st = self.status()
@@ -163,7 +163,7 @@ class CD:
         r = self.h.get(f"{BASE}/footprint.php",
                        params={"symbol": INSTRUMENTS["GC"]["sym"], "tf": TF,
                                "from": to - minutes * 60, "to": to})
-        if r.status_code == 401:
+        if r.status_code in (401, 403):
             self.ensure()
             r = self.h.get(f"{BASE}/footprint.php",
                            params={"symbol": INSTRUMENTS["GC"]["sym"], "tf": TF,
