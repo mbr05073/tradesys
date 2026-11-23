@@ -646,38 +646,42 @@ def main():
 
 if __name__ == "__main__":
     if len(sys.argv) > 1 and sys.argv[1] == "check":
-        # فحص فوري لكل أداة: يطبع القرار الحيّ ويرسله للقناة.
+        # رسالة منفصلة لكل أداة — لا تُخلط القراءتان.
         c = db(); cd = CD(); ts = int(time.time())
-        lines = [f"🔎 فحص فوري — {now_riy(ts)} الرياض", ""]
         for inst, cfg in INSTRUMENTS.items():
+            x = [f"🔎 فحص فوري — {cfg['name']}", f"{now_riy(ts)} الرياض", ""]
             try:
                 if not is_open(cfg, ts):
-                    lines += [f"{cfg['name']}: السوق مغلق", ""]
-                    print(cfg["name"], "— السوق مغلق"); continue
-                bars = cd.bars()[0] if cfg["src"] == "cd" else okx_bars(cfg["sym"], cfg["bucket"])
-                bad = integrity(bars, ts)
-                sig, why = propose(bars)
-                w = bars[-WIN:]; pr = profile(w)
-                led = ledger(c, ts, inst)
-                blk = risk_block(led, cfg["max"])
-                lines += [f"{cfg['name']}  ({len(bars)} شمعة)",
-                          f"  السعر {w[-1]['c']:,.1f} · دلتا {delta_ratio(w[-1])*100:+.1f}%"
-                          f" · مدى {rng(w):,.2f}",
-                          f"  VAL {pr['val']:,.1f} · POC {pr['poc']:,.1f} · VAH {pr['vah']:,.1f}",
-                          f"  سلامة: {'سليمة' if not bad else ' / '.join(bad)}",
-                          f"  القرار: " + (
-                              f"إشارة {sig['side']} دخول {sig['entry']:,.1f} ستوب {sig['stop']:,.1f}"
-                              f" R:R 1:{sig['rr']}" if sig else (blk or why)),
-                          f"  اليوم: {led['sent']}/{cfg['max']} · {led['r']:+.2f}R", ""]
-                a = analyze(cfg, bars, sig, blk or why)
-                if a:
-                    lines += ["🧠 قراءة التدفق:", a, ""]
-                print(lines[-6] if not a else cfg["name"]); print("تم")
+                    x.append("السوق مغلق")
+                else:
+                    bars = cd.bars() if cfg["src"] == "cd" else okx_bars(
+                        cfg["sym"], cfg["bucket"])
+                    if cfg["src"] == "cd":
+                        bars = bars[0] if isinstance(bars, tuple) else bars
+                    bad = integrity(bars, ts)
+                    sig, why = propose(bars)
+                    w = bars[-WIN:]; pr = profile(w)
+                    led = ledger(c, ts, inst)
+                    blk = risk_block(led, cfg["max"]) or news_block(ts)
+                    x += [f"{len(bars)} شمعة",
+                          f"السعر {w[-1]['c']:,.1f} · دلتا "
+                          f"{delta_ratio(w[-1])*100:+.1f}% · مدى {rng(w):,.2f}",
+                          f"VAL {pr['val']:,.1f} · POC {pr['poc']:,.1f} · "
+                          f"VAH {pr['vah']:,.1f}",
+                          f"سلامة: {'سليمة' if not bad else ' / '.join(bad)}",
+                          "القرار: " + (
+                              f"إشارة {sig['side']} دخول {sig['entry']:,.1f} "
+                              f"ستوب {sig['stop']:,.1f} R:R 1:{sig['rr']}"
+                              if sig and not blk else (blk or why)),
+                          f"اليوم: {led['sent']}/{cfg['max']} · {led['r']:+.2f}R",
+                          news_line()]
+                    a = analyze(cfg, bars, sig if not blk else None, blk or why)
+                    if a:
+                        x += ["", "🧠 قراءة التدفق:", a]
             except Exception as e:
-                lines += [f"{cfg['name']}: خطأ — {type(e).__name__}: {e}"[:200], ""]
-                print(cfg["name"], "خطأ:", type(e).__name__, str(e)[:120])
-        say("\n".join(lines))
-        print("أُرسل للقناة.")
+                x.append(f"خطأ — {type(e).__name__}: {e}"[:250])
+            say("\n".join(x))
+            print(cfg["name"], "— أُرسلت")
     elif len(sys.argv) > 1 and sys.argv[1] == "register":
         import getpass
         cd = CD()
