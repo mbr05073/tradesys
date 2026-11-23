@@ -119,32 +119,66 @@ def verify(bars):
     return bad
 
 
-def outcome(bars, i, sig):
-    entry, stop, t1 = sig["entry"], sig["stop"], sig["targets"][0]
+def outcome(bars, i, sig, scale=False):
+    """نتيجة الصفقة بوحدة R.
+
+    scale=False: خروج كامل عند الهدف الأول (1:2).
+    scale=True : ثلث عند كل هدف (1:2 · 1:3 · 1:4) ونقل الستوب للتعادل
+                 بعد الهدف الأول. هذا ما يفعله المتداول فعلياً.
+
+    الستوب يفوز عند الالتباس داخل الشمعة في الحالتين.
+    """
+    entry, stop = sig["entry"], sig["stop"]
+    t1, t2, t3 = sig["targets"]
     risk = abs(entry - stop)
     if risk <= 0:
         return None
+    buy = sig["side"] == "buy"
     active = False
+    cur_stop = stop
+    got = 0                      # كم هدفاً تحقق
+    r = 0.0
     for k in range(i + 1, min(i + 1 + MAX_HOLD, len(bars))):
         b = bars[k]
         if not active:
             if b["l"] <= entry <= b["h"]:
                 active = True
             elif k - i > ENTRY_WINDOW:
-                return {"st": "not_filled", "r": 0.0}
+                return {"st": "not_filled", "r": 0.0, "hit": 0}
             else:
                 continue
-        hs = b["l"] <= stop if sig["side"] == "buy" else b["h"] >= stop
-        ht = b["h"] >= t1 if sig["side"] == "buy" else b["l"] <= t1
-        if hs:                      # الستوب يفوز عند الالتباس
-            return {"st": "stop", "r": -1.0 - COST}
-        if ht:
-            return {"st": "target", "r": abs(t1 - entry) / risk - COST}
-    return {"st": "expired", "r": 0.0}
+        hs = b["l"] <= cur_stop if buy else b["h"] >= cur_stop
+        if hs:                   # الستوب يفوز عند الالتباس
+            left = 1.0 if not scale else (3 - got) / 3
+            loss = (abs(cur_stop - entry) / risk) * (-1 if cur_stop == stop else 0)
+            return {"st": "stop" if got == 0 else f"stop_after_t{got}",
+                    "r": round(r + loss * left - COST, 3), "hit": got}
+        if not scale:
+            if (b["h"] >= t1) if buy else (b["l"] <= t1):
+                return {"st": "target", "r": round(abs(t1 - entry) / risk - COST, 3),
+                        "hit": 1}
+            continue
+        for n, t in ((1, t1), (2, t2), (3, t3)):
+            if got >= n:
+                continue
+            if (b["h"] >= t) if buy else (b["l"] <= t):
+                r += (abs(t - entry) / risk) / 3
+                got = n
+                if n == 1:
+                    cur_stop = entry          # تعادل بعد الهدف الأول
+        if got == 3:
+            return {"st": "target3", "r": round(r - COST, 3), "hit": 3}
+    # انتهت المهلة: نغلق الباقي عند إغلاق آخر شمعة
+    if active and scale and got:
+        last = bars[min(i + MAX_HOLD, len(bars) - 1)]["c"]
+        left = (3 - got) / 3
+        r += ((last - entry) / risk if buy else (entry - last) / risk) * left
+        return {"st": f"expired_t{got}", "r": round(r - COST, 3), "hit": got}
+    return {"st": "expired", "r": 0.0, "hit": got}
 
 
 def stats(trades):
-    f = [t for t in trades if t["st"] in ("stop", "target")]
+    f = [t for t in trades if t["st"] != "not_filled" and t["r"] != 0.0]
     if not f:
         return None
     rs = [t["r"] for t in f]
@@ -160,7 +194,7 @@ def stats(trades):
             "dd": round(dd, 1), "streak": worst}
 
 
-def run(bars, cfg, rules=True, bands=None):
+def run(bars, cfg, rules=True, bands=None, scale=False):
     """يُعيد قائمة الصفقات. rules=True يطبّق حدود المخاطرة اليومية."""
     trades = []
     day = None; dr = 0.0; n = 0; cs = 0
@@ -177,7 +211,7 @@ def run(bars, cfg, rules=True, bands=None):
         if rules and (n >= cfg["max"] or dr <= T.LOSS_CAP
                       or dr >= T.DAY_TARGET or cs >= T.MAX_CONSEC):
             continue
-        o = outcome(bars, i, sig)
+        o = outcome(bars, i, sig, scale=scale)
         if not o:
             continue
         n += 1
@@ -223,6 +257,16 @@ def main():
     print(line("بقواعد المخاطرة", stats(full)))
     if bands:
         print(line(f"+ نطاقات {BANDS}", stats(run(bars, cfg, True, bands))))
+    sc = run(bars, cfg, rules=True, bands=bands, scale=True)
+    print("\n=== الخروج: كامل عند 1:2 مقابل تقسيم 1:2 · 1:3 · 1:4 ===")
+    print(line("كامل عند الهدف الأول", stats(full)))
+    print(line("ثلث عند كل هدف", stats(sc)))
+    from collections import Counter
+    cn = Counter(t["hit"] for t in sc if t["st"] not in ("not_filled",))
+    tot = sum(cn.values()) or 1
+    print(f"  بلوغ الأهداف: صفر {cn[0]*100//tot}% · "
+          f"الأول {cn[1]*100//tot}% · الثاني {cn[2]*100//tot}% · "
+          f"الثالث {cn[3]*100//tot}%")
 
     cut = bars[0]["ts"] + int((bars[-1]["ts"] - bars[0]["ts"]) * 0.67)
     print(f"\n=== تحقق زمني (ضبط حتى {f(cut)}) ===")
