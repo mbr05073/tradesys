@@ -180,6 +180,8 @@ class CD:
             out.append({"ts": int(b["t"]), "o": float(b["o"]), "h": float(b["h"]),
                         "l": float(b["l"]), "c": float(b["c"]), "v": float(b["v"]),
                         "d": float(b.get("d", buy - sell)),
+                        "md": float(b.get("md", 0.0)),
+                        "xd": float(b.get("xd", 0.0)),
                         "buy": buy, "sell": sell, "lv": lv})
         out.sort(key=lambda x: x["ts"])
         return out, tick
@@ -199,6 +201,83 @@ def worth_analysis(bars, sig):
     return near or abs(delta_ratio(w[-1])) >= 0.15
 
 
+def hvn_lvn(w, n=4):
+    """عقد الحجم المرتفع والمنخفض داخل النافذة."""
+    tot = {}
+    for b in w:
+        for pz, (a, bd) in b["lv"].items():
+            tot[pz] = tot.get(pz, 0.0) + a + bd
+    if len(tot) < 5:
+        return [], []
+    avg = sum(tot.values()) / len(tot)
+    hv = sorted((k for k in tot if tot[k] > 1.8 * avg), key=lambda k: -tot[k])[:n]
+    lv = sorted((k for k in tot if tot[k] < 0.3 * avg))[:n]
+    return hv, lv
+
+
+def _dec(bucket):
+    """عدد الكسور اللازم لعرض سعر بهذه الخانة بلا فقدان دقة."""
+    d = 0
+    x = float(bucket)
+    while x < 1 and d < 6:
+        x *= 10; d += 1
+    return d
+
+
+def _fmt(p, bucket):
+    return f"{p:,.{_dec(bucket)}f}"
+
+
+def footprint_text(b, bucket):
+    """أقوى مستويات الشمعة: السعر · Ask · Bid · الاختلال."""
+    if not b["lv"]:
+        return "لا مستويات"
+    rows = sorted(b["lv"].items(), key=lambda kv: -(kv[1][0] + kv[1][1]))[:8]
+    out = []
+    for pz, (a, bd) in sorted(rows, key=lambda kv: -kv[0]):
+        tag = ""
+        if bd > 0 and a >= 3 * bd:
+            tag = " ⇧اختلال شراء"
+        elif a > 0 and bd >= 3 * a:
+            tag = " ⇩اختلال بيع"
+        out.append(f"  {_fmt(pz, bucket)}  Ask {a:,.0f} · Bid {bd:,.0f}{tag}")
+    return "\n".join(out)
+
+
+def flow_flags(w, bucket):
+    """إشارات تُقرأ من الفوتبرنت نفسه لا من الشموع."""
+    b = w[-1]
+    f = []
+    rngb = b["h"] - b["l"]
+    dr = delta_ratio(b)
+    # امتصاص: ضغط دلتا قوي بلا تقدم سعري
+    if abs(dr) >= 0.25 and rngb > 0:
+        avg_r = rng(w)
+        if avg_r > 0 and rngb < 0.5 * avg_r:
+            f.append(f"امتصاص محتمل: دلتا {dr*100:+.0f}% ومدى الشمعة "
+                     f"{rngb:.4g} أقل من نصف المتوسط {avg_r:.4g}")
+    # مزاد غير مكتمل: حجم معتبر عند الطرف
+    if b["lv"]:
+        hi, lo = max(b["lv"]), min(b["lv"])
+        vol = [a + x for a, x in b["lv"].values()]
+        mx = max(vol) or 1
+        at_hi = sum(b["lv"][hi]); at_lo = sum(b["lv"][lo])
+        if at_hi >= 0.35 * mx:
+            f.append(f"مزاد غير مكتمل عند القمة {_fmt(hi, bucket)}")
+        if at_lo >= 0.35 * mx:
+            f.append(f"مزاد غير مكتمل عند القاع {_fmt(lo, bucket)}")
+    # تطرّف الدلتا داخل الشمعة
+    if b.get("xd") or b.get("md"):
+        f.append(f"الدلتا داخل الشمعة: أعلى {b.get('xd',0):+,.0f} · "
+                 f"أدنى {b.get('md',0):+,.0f} · الإغلاق {b['d']:+,.0f}")
+    # حبس: دلتا قوية وإغلاق معاكس
+    if abs(dr) >= 0.20:
+        up = b["c"] > b["o"]
+        if (dr > 0 and not up) or (dr < 0 and up):
+            f.append(f"حبس محتمل: دلتا {dr*100:+.0f}% وإغلاق معاكس")
+    return f
+
+
 def analyze(cfg, bars, sig, why):
     """قراءة سياق من النموذج. يُرجع نصاً أو None.
 
@@ -212,10 +291,19 @@ def analyze(cfg, bars, sig, why):
     rows = [f"{datetime.fromtimestamp(b['ts'], RIY).strftime('%H:%M')} "
             f"o{b['o']:.1f} h{b['h']:.1f} l{b['l']:.1f} c{b['c']:.1f} "
             f"د{delta_ratio(b)*100:+.0f}%" for b in w[-14:]]
+    hv, lv = hvn_lvn(w)
+    cum = sum(b["buy"] - b["sell"] for b in w)
+    flags = flow_flags(w, cfg["bucket"])
     state = (f"الأداة: {cfg['name']}\n"
              f"السعر {w[-1]['c']:,.1f} · المدى {rng(w):,.2f}\n"
              f"البروفايل: VAL {pr['val']:,.1f} · POC {pr['poc']:,.1f} · VAH {pr['vah']:,.1f}\n"
-             f"آخر 14 شمعة (5 دقائق):\n" + "\n".join(rows) + "\n\n"
+             f"عقد حجم مرتفع: {', '.join(_fmt(x, cfg['bucket']) for x in hv) or '—'}\n"
+             f"عقد حجم منخفض: {', '.join(_fmt(x, cfg['bucket']) for x in lv) or '—'}\n"
+             f"صافي دلتا النافذة (3 ساعات): {cum:+,.0f}\n\n"
+             f"فوتبرنت آخر شمعة — أقوى المستويات:\n"
+             + footprint_text(w[-1], cfg["bucket"]) + "\n\n"
+             + ("ملاحظات من التدفق:\n- " + "\n- ".join(flags) + "\n\n" if flags else "")
+             + f"آخر 14 شمعة (5 دقائق):\n" + "\n".join(rows) + "\n\n"
              + (f"إشارة: {sig['side']} دخول {sig['entry']:,.1f} ستوب {sig['stop']:,.1f}"
                 f" هدف {sig['targets'][0]:,.1f} R:R 1:{sig['rr']}"
                 if sig else f"لا إشارة. السبب: {why}"))
@@ -226,7 +314,9 @@ def analyze(cfg, bars, sig, why):
         "3) الحبس: هل يوجد متداولون محبوسون (دلتا عالية مع إغلاق معاكس أو فشل استمرار)؟\n"
         "4) الامتصاص: هل يظهر امتصاص واضح (ضغط دلتا قوي دون تقدم سعري مقابل)؟\n"
         "5) الحكم على الصورة الكاملة: خلاصة الموقف في سطر واحد (متماسك / حذر / متعارض) وما الذي يؤكده أو ينفيه.\n"
-        "قواعد صارمة: لا توصِ بدخول ولا تذكر أهدافاً — القرار محكوم بقواعد ثابتة خارج نطاقك. لا تخترع أرقاماً غير المعطاة.\n\n"
+        "قواعد صارمة: لا توصِ بدخول ولا تذكر أهدافاً — القرار محكوم بقواعد ثابتة خارج نطاقك. "
+        "لا تخترع أرقاماً غير المعطاة. اعتمد على الفوتبرنت وملاحظات التدفق أولاً، "
+        "وإن لم تكفِ البيانات للحكم على بند فقل ذلك صراحة بدل التخمين.\n\n"
         + state
     )
     try:
