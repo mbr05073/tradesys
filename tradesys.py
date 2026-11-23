@@ -201,6 +201,75 @@ def worth_analysis(bars, sig):
     return near or abs(delta_ratio(w[-1])) >= 0.15
 
 
+_HTF = {}      # ذاكرة الإطار الأعلى — نصف ساعة
+
+
+def agg(bars, minutes):
+    """تجميع شمعات 5 دقائق إلى إطار أعلى."""
+    sec = minutes * 60
+    out = {}
+    for b in bars:
+        k = b["ts"] - (b["ts"] % sec)
+        g = out.get(k)
+        if g is None:
+            out[k] = {"ts": k, "o": b["o"], "h": b["h"], "l": b["l"],
+                      "c": b["c"], "d": b["d"], "v": b["v"]}
+        else:
+            g["h"] = max(g["h"], b["h"]); g["l"] = min(g["l"], b["l"])
+            g["c"] = b["c"]; g["d"] += b["d"]; g["v"] += b["v"]
+    return [out[k] for k in sorted(out)]
+
+
+def htf_context(inst, cfg, cd, now):
+    """سياق الإطار الأعلى: مستويات اليوم والأمس والأسبوع، واتجاه 4 ساعات.
+
+    نافذة القرار 3 ساعات تعمي النظام عن المستويات الكبرى، وهي أول ما يقرأه
+    متداول حقيقي. نسحب 7 أيام ونجمّعها محلياً — بلا مصدر جديد.
+    """
+    c = _HTF.get(inst)
+    if c and now - c["at"] < 1800:
+        return c["txt"]
+    try:
+        if cfg["src"] == "cd":
+            bars = cd.bars(minutes=7 * 24 * 60)
+        else:
+            bars = okx_bars(cfg["sym"], cfg["bucket"], limit=300)
+        if len(bars) < 50:
+            return None
+        bk = cfg["bucket"]
+        day = 86400
+        today = now - (now % day)
+        d_now = [b for b in bars if b["ts"] >= today]
+        d_prev = [b for b in bars if today - day <= b["ts"] < today]
+        wk = bars[-min(len(bars), 7 * 288):]
+        h4 = agg(bars, 240)[-6:]
+        rows = [f"  {datetime.fromtimestamp(b['ts'], RIY).strftime('%d/%m %H:%M')} "
+                f"ع{_fmt(b['o'], bk)} ق{_fmt(b['h'], bk)} ن{_fmt(b['l'], bk)} "
+                f"إ{_fmt(b['c'], bk)} دلتا {b['d']:+,.0f}" for b in h4]
+        lines = ["الإطار الأعلى:"]
+        if d_prev:
+            lines.append(f"  أمس: قمة {_fmt(max(b['h'] for b in d_prev), bk)} · "
+                         f"قاع {_fmt(min(b['l'] for b in d_prev), bk)}")
+        if d_now:
+            lines.append(f"  اليوم: قمة {_fmt(max(b['h'] for b in d_now), bk)} · "
+                         f"قاع {_fmt(min(b['l'] for b in d_now), bk)} · "
+                         f"صافي دلتا {sum(b['d'] for b in d_now):+,.0f}")
+        if wk:
+            lines.append(f"  الأسبوع: قمة {_fmt(max(b['h'] for b in wk), bk)} · "
+                         f"قاع {_fmt(min(b['l'] for b in wk), bk)}")
+        pr7 = profile(bars[-2016:]) if cfg["src"] == "cd" else None
+        if pr7:
+            lines.append(f"  بروفايل الأسبوع: VAL {_fmt(pr7['val'], bk)} · "
+                         f"POC {_fmt(pr7['poc'], bk)} · VAH {_fmt(pr7['vah'], bk)}")
+        lines.append("  آخر 6 شمعات 4 ساعات:")
+        lines += rows
+        txt = "\n".join(lines)
+        _HTF[inst] = {"at": now, "txt": txt}
+        return txt
+    except Exception:
+        return None
+
+
 def hvn_lvn(w, n=4):
     """عقد الحجم المرتفع والمنخفض داخل النافذة."""
     tot = {}
@@ -278,7 +347,7 @@ def flow_flags(w, bucket):
     return f
 
 
-def analyze(cfg, bars, sig, why):
+def analyze(cfg, bars, sig, why, cd=None):
     """قراءة سياق من النموذج. يُرجع نصاً أو None.
 
     النموذج يشرح ولا يقرر: بوابة المخاطرة والقواعد في الكود، وأي اقتراح
@@ -291,6 +360,7 @@ def analyze(cfg, bars, sig, why):
     rows = [f"{datetime.fromtimestamp(b['ts'], RIY).strftime('%H:%M')} "
             f"o{b['o']:.1f} h{b['h']:.1f} l{b['l']:.1f} c{b['c']:.1f} "
             f"د{delta_ratio(b)*100:+.0f}%" for b in w[-14:]]
+    htf = htf_context(cfg.get("_inst", cfg["name"]), cfg, cd, int(time.time())) if cd or cfg["src"] == "okx" else None
     hv, lv = hvn_lvn(w)
     cum = sum(b["buy"] - b["sell"] for b in w)
     flags = flow_flags(w, cfg["bucket"])
@@ -300,7 +370,8 @@ def analyze(cfg, bars, sig, why):
              f"عقد حجم مرتفع: {', '.join(_fmt(x, cfg['bucket']) for x in hv) or '—'}\n"
              f"عقد حجم منخفض: {', '.join(_fmt(x, cfg['bucket']) for x in lv) or '—'}\n"
              f"صافي دلتا النافذة (3 ساعات): {cum:+,.0f}\n\n"
-             f"فوتبرنت آخر شمعة — أقوى المستويات:\n"
+             + ((htf + "\n\n") if htf else "")
+             + "فوتبرنت آخر شمعة — أقوى المستويات:\n"
              + footprint_text(w[-1], cfg["bucket"]) + "\n\n"
              + ("ملاحظات من التدفق:\n- " + "\n- ".join(flags) + "\n\n" if flags else "")
              + f"آخر 14 شمعة (5 دقائق):\n" + "\n".join(rows) + "\n\n"
@@ -308,27 +379,39 @@ def analyze(cfg, bars, sig, why):
                 f" هدف {sig['targets'][0]:,.1f} R:R 1:{sig['rr']}"
                 if sig else f"لا إشارة. السبب: {why}"))
     prompt = (
-        "أنت محلل تدفق أوامر وسلوك سعري (Order Flow & CRT). اقرأ البيانات وأجب بالعربية باختصار وحسم في 5 نقاط فقط:\n"
-        "1) السياق: موقع السعر من البروفايل (VAH/POC/VAL) ومن يسيطر على التدفق الآن.\n"
-        "2) CRT: هل حصل سحب سيولة لقمة أو قاع النطاق/الشموع ثم عودة للداخل؟\n"
-        "3) الحبس: هل يوجد متداولون محبوسون (دلتا عالية مع إغلاق معاكس أو فشل استمرار)؟\n"
-        "4) الامتصاص: هل يظهر امتصاص واضح (ضغط دلتا قوي دون تقدم سعري مقابل)؟\n"
-        "5) الحكم على الصورة الكاملة: خلاصة الموقف في سطر واحد (متماسك / حذر / متعارض) وما الذي يؤكده أو ينفيه.\n"
-        "قواعد صارمة: لا توصِ بدخول ولا تذكر أهدافاً — القرار محكوم بقواعد ثابتة خارج نطاقك. "
-        "لا تخترع أرقاماً غير المعطاة. اعتمد على الفوتبرنت وملاحظات التدفق أولاً، "
-        "وإن لم تكفِ البيانات للحكم على بند فقل ذلك صراحة بدل التخمين.\n\n"
+        "أنت محلل تدفق أوامر محترف. تحليلك مؤصَّل على: نظرية المزاد "
+        "(Auction Market Theory) وبروفايل الحجم، وقراءة الفوتبرنت "
+        "(امتصاص · اختلال · مزاد غير مكتمل · حبس)، وCRT/سحب السيولة.\n\n"
+        "أجب بالعربية في ست نقاط مرقّمة، سطر أو سطران لكل نقطة:\n"
+        "1) السياق الأعلى: موقع السعر من مستويات اليوم والأمس والأسبوع، "
+        "واتجاه شمعات 4 ساعات. هل نحن في اتجاه أم في نطاق؟\n"
+        "2) المزاد: السعر داخل نطاق القيمة أم خارجه؟ وهل المزاد يقبل "
+        "السعر (حجم يتراكم) أم يرفضه (عودة سريعة)؟\n"
+        "3) الفوتبرنت: ماذا تقول أحجام Ask وBid عند المستويات المعطاة؟ "
+        "اذكر مستوى واحداً بالرقم وما يعنيه.\n"
+        "4) CRT وسحب السيولة: هل جرى اختراق قمة أو قاع ثم عودة للداخل؟\n"
+        "5) التعارضات: ما الذي يناقض القراءة؟ اذكره صراحة. إن لم يوجد "
+        "تعارض فقل ذلك.\n"
+        "6) الحكم: متماسك / حذر / متعارض — وما الشرط الذي يؤكده أو ينفيه.\n\n"
+        "انضباط إلزامي:\n"
+        "• لا توصِ بدخول ولا تذكر أهدافاً — القرار محكوم بقواعد ثابتة خارج نطاقك.\n"
+        "• لا تذكر رقماً غير موجود في البيانات. لا تقدّر ولا تستنتج أسعاراً.\n"
+        "• إن لم تكفِ البيانات لبند، اكتب «البيانات لا تكفي» وانتقل. "
+        "قراءة ناقصة صادقة أنفع من قراءة كاملة مخترَعة.\n"
+        "• «ملاحظات من التدفق» مُحتسَبة من الفوتبرنت الحقيقي — اعتمدها، "
+        "ولا تدّعِ امتصاصاً أو حبساً لم يرد فيها.\n\n"
         + state
     )
     try:
         r = httpx.post("https://api.groq.com/openai/v1/chat/completions",
                        headers={"Authorization": f"Bearer {GROQ_KEY}"},
                        json={"model": GROQ_MODEL, "temperature": 0.3,
-                             "max_tokens": 550,
+                             "max_tokens": 800,
                              "messages": [{"role": "user", "content": prompt}]},
                        timeout=30)
         if r.status_code != 200:
             return None
-        return r.json()["choices"][0]["message"]["content"].strip()[:1200]
+        return r.json()["choices"][0]["message"]["content"].strip()[:1800]
     except Exception:
         return None
 
@@ -666,7 +749,7 @@ def scan(c, cd, ts, inst, cfg):
                s["delta"]))
     c.commit()
     msg = sig_text(s, l, ts, cfg)
-    a = analyze(cfg, bars, s, None)
+    a = analyze(cfg, bars, s, None, cd)
     if a:
         msg += "\n\n🧠 قراءة التدفق:\n" + a
     say(msg)
@@ -754,6 +837,7 @@ def main():
                 last_scan = ts - (ts % SCAN)
                 for inst, cfg in INSTRUMENTS.items():
                     try:
+                        cfg["_inst"] = inst
                         ok, ctx, why, bad = scan(c, cd, ts, inst, cfg)
                         if cfg.get("_bars") is not None:
                             last_bars[inst] = cfg.pop("_bars")
@@ -781,7 +865,7 @@ def main():
                                         bad, ts, cfg)
                         bl = last_bars.get(inst)
                         if bl and worth_analysis(bl, None):
-                            a = analyze(cfg, bl, None, why)
+                            a = analyze(cfg, bl, None, why, cd)
                             if a:
                                 msg += "\n\n🧠 قراءة التدفق:\n" + a
                         say(msg)
@@ -808,6 +892,7 @@ if __name__ == "__main__":
         # رسالة منفصلة لكل أداة — لا تُخلط القراءتان.
         c = db(); cd = CD(); ts = int(time.time())
         for inst, cfg in INSTRUMENTS.items():
+            cfg["_inst"] = inst
             x = [f"🔎 فحص فوري — {cfg['name']}", f"{now_riy(ts)} الرياض", ""]
             try:
                 if not is_open(cfg, ts):
@@ -834,7 +919,7 @@ if __name__ == "__main__":
                               if sig and not blk else (blk or why)),
                           f"اليوم: {led['sent']}/{cfg['max']} · {led['r']:+.2f}R",
                           news_line()]
-                    a = analyze(cfg, bars, sig if not blk else None, blk or why)
+                    a = analyze(cfg, bars, sig if not blk else None, blk or why, cd)
                     if a:
                         x += ["", "🧠 قراءة التدفق:", a]
             except Exception as e:
