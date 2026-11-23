@@ -390,6 +390,10 @@ def db():
     c.execute("""CREATE TABLE IF NOT EXISTS sig(
         id INTEGER PRIMARY KEY, ts INT, day TEXT, inst TEXT, side TEXT, entry REAL,
         stop REAL, t1 REAL, t2 REAL, t3 REAL, rr REAL, status TEXT, r REAL)""")
+    # أرشيف الشمعات — OKX لا تعطي تاريخ الدلتا، فنبنيه بأنفسنا.
+    c.execute("""CREATE TABLE IF NOT EXISTS bar(
+        inst TEXT, ts INT, o REAL, h REAL, l REAL, c REAL,
+        v REAL, d REAL, PRIMARY KEY(inst, ts))""")
     # ترحيل: قواعد أُنشئت قبل إضافة البتكوين تفتقد عمود inst.
     cols = {r[1] for r in c.execute("PRAGMA table_info(sig)")}
     if "delta" not in cols:
@@ -426,6 +430,19 @@ def risk_block(l, mx):
     if l["r"] >= DAY_TARGET: return f"تحقق هدف اليوم +{DAY_TARGET}R"
     if l["consec"] >= MAX_CONSEC: return "خسارتان متتاليتان — توقف"
     return None
+
+
+def archive(c, inst, bars):
+    """يحفظ الشمعات المسحوبة. مصدر الذهب يعطي تاريخه، أما البتكوين فلا —
+    فهذا الأرشيف هو السبيل الوحيد لاختباره خلفياً لاحقاً."""
+    try:
+        c.executemany(
+            "INSERT OR IGNORE INTO bar(inst,ts,o,h,l,c,v,d) VALUES(?,?,?,?,?,?,?,?)",
+            [(inst, b["ts"], b["o"], b["h"], b["l"], b["c"], b["v"], b["d"])
+             for b in bars])
+        c.commit()
+    except Exception:
+        pass
 
 
 def update(c, inst, bars):
@@ -534,6 +551,7 @@ def scan(c, cd, ts, inst, cfg):
     else:
         bars = okx_bars(cfg["sym"], cfg["bucket"])
     cfg["_bars"] = bars
+    archive(c, inst, bars)
     update(c, inst, bars)
     bad = integrity(bars, ts)
     if bad:
