@@ -127,13 +127,35 @@ class CD:
         return None
 
     def ensure(self):
+        """جلسة صالحة، مع إعادة تسجيل تلقائية عند إلغاء الجهاز.
+
+        ClusterDelta تربط الجلسة بجهاز واحد: أي دخول من المتصفح يُلغي جهاز
+        السيرفر ويوقف الذهب. التسجيل اليدوي كل مرة غير عملي، فإن توفّرت
+        بيانات الدخول في ملف البيئة نعيد التسجيل مرة واحدة تلقائياً.
+        """
         st = self.status()
         if st.get("login"):
             return st
         st = self.resume()
         if st and st.get("login"):
             return st
-        raise RuntimeError("لا جلسة ClusterDelta — سجّل الجهاز")
+        login, pw = os.getenv("CD_LOGIN", ""), os.getenv("CD_PASSWORD", "")
+        if login and pw:
+            now = int(time.time())
+            # لا نكرر محاولة فاشلة أكثر من مرة كل عشر دقائق
+            if now - getattr(self, "_last_reg", 0) > 600:
+                self._last_reg = now
+                try:
+                    out = self.register(login, pw)
+                    say(f"🔑 أُعيد تسجيل جهاز ClusterDelta تلقائياً — "
+                        f"{out.get('login')} · ينتهي {out.get('expiration')}")
+                    return out
+                except Exception as e:
+                    raise RuntimeError(
+                        f"فشل إعادة التسجيل التلقائي لـ ClusterDelta: {e}")
+        raise RuntimeError("لا جلسة ClusterDelta — سجّل الجهاز، أو ضع "
+                           "CD_LOGIN و CD_PASSWORD في /etc/tradesys.env "
+                           "ليُعاد التسجيل تلقائياً")
 
     def bars(self, minutes=600):
         """المستويات [تكّات, Ask=شراء, Bid=بيع]؛ السعر = التكّات × tickSize."""
@@ -462,7 +484,7 @@ def hour_text(ctx, why, l, bad, ts, cfg):
     x += ["", f"اليوم: {l['sent']}/{cfg['max']} صفقات · المحقق {l['r']:+.2f}R"]
     x += ["ملاحظة: لا سعر مرجعي مستقل — التحقق داخلي فقط" if cfg["src"] == "cd"
           else "ملاحظة: دلتا OKX حقيقية لكل 5 دقائق، وتوزيعها على المستويات تقريبي",
-          "فلتر الأخبار: معطّل — لا تغذية أخبار مُعدّة"]
+          news_line()]
     return "\n".join(x)
 
 
@@ -487,8 +509,19 @@ def news_block(ts, before_min=30, after_min=20):
                 t_str = datetime.fromtimestamp(ev_ts, RIY).strftime("%H:%M")
                 return f"فلتر الأخبار: {title} ({t_str} الرياض)"
     except Exception:
-        pass
+        _NEWS_CACHE["ok"] = False
+        return None
+    _NEWS_CACHE["ok"] = True
     return None
+
+
+def news_line():
+    """حالة الفلتر في التقرير — لا يدّعي حماية غير قائمة."""
+    if not _NEWS_CACHE.get("events") and not _NEWS_CACHE.get("ok"):
+        return "فلتر الأخبار: التغذية لا تستجيب — لا حماية الآن"
+    n = len(_NEWS_CACHE.get("events") or [])
+    return f"فلتر الأخبار: يعمل · {n} خبر USD عالي التأثير هذا الأسبوع"
+
 
 def scan(c, cd, ts, inst, cfg):
     if not is_open(cfg, ts):
