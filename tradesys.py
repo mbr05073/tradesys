@@ -392,6 +392,8 @@ def db():
         stop REAL, t1 REAL, t2 REAL, t3 REAL, rr REAL, status TEXT, r REAL)""")
     # ترحيل: قواعد أُنشئت قبل إضافة البتكوين تفتقد عمود inst.
     cols = {r[1] for r in c.execute("PRAGMA table_info(sig)")}
+    if "delta" not in cols:
+        c.execute("ALTER TABLE sig ADD COLUMN delta REAL")
     if "inst" not in cols:
         c.execute("ALTER TABLE sig ADD COLUMN inst TEXT")
         c.execute("UPDATE sig SET inst='GC' WHERE inst IS NULL")
@@ -549,10 +551,11 @@ def scan(c, cd, ts, inst, cfg):
         return False, ctx, why, bad
     if blk:
         return False, ctx, blk, bad
-    c.execute("INSERT INTO sig(ts,day,inst,side,entry,stop,t1,t2,t3,rr,status,r) "
-              "VALUES(?,?,?,?,?,?,?,?,?,?, 'pending', 0)",
+    c.execute("INSERT INTO sig(ts,day,inst,side,entry,stop,t1,t2,t3,rr,delta,"
+              "status,r) VALUES(?,?,?,?,?,?,?,?,?,?,?, 'pending', 0)",
               (ts, day_str(ts), inst, s["side"], s["entry"], s["stop"],
-               s["targets"][0], s["targets"][1], s["targets"][2], s["rr"]))
+               s["targets"][0], s["targets"][1], s["targets"][2], s["rr"],
+               s["delta"]))
     c.commit()
     msg = sig_text(s, l, ts, cfg)
     a = analyze(cfg, bars, s, None)
@@ -560,6 +563,51 @@ def scan(c, cd, ts, inst, cfg):
         msg += "\n\n🧠 قراءة التدفق:\n" + a
     say(msg)
     return True, ctx, None, bad
+
+
+# نطاقات قيد المراقبة — تُقاس ولا تُطبَّق. القرار بعد 30-50 صفقة حقيقية.
+SHADOW = {
+    "استبعاد 22–25%":        [(0.18, 0.22), (0.25, 1.10)],
+    "استبعاد 22–30%":        [(0.18, 0.22), (0.30, 1.10)],
+    "18–22% فقط":            [(0.18, 0.22)],
+}
+
+
+def shadow_text(c, inst=None):
+    """يقارن أداء النظام الفعلي بما كانت ستعطيه النطاقات — بلا تطبيق.
+
+    هذا تحقق أمامي نظيف: البيانات لم يرها أحد عند وضع القاعدة، فلا تداخل
+    عيّنات ولا تطويع. القاعدة لا تُفعَّل إلا إن تفوّقت هنا.
+    """
+    q = "SELECT inst,delta,r,status FROM sig WHERE status IN ('stop','target')"
+    rows = [r for r in c.execute(q) if r[1] is not None]
+    if inst:
+        rows = [r for r in rows if r[0] == inst]
+    out = ["🔬 وضع الظل — مقارنة قواعد قيد المراقبة", ""]
+    if len(rows) < 5:
+        out.append(f"العيّنة {len(rows)} صفقة — صغيرة جداً. "
+                   "نحتاج 30 على الأقل قبل أي حكم.")
+        return "\n".join(out)
+
+    def m(sub):
+        if not sub:
+            return "— لا صفقات"
+        rs = [x[2] or 0 for x in sub]
+        peak = run = dd = 0.0
+        for r in rs:
+            run += r; peak = max(peak, run); dd = max(dd, peak - run)
+        w = sum(1 for r in rs if r > 0) / len(rs)
+        return (f"n={len(rs):3d} · نجاح {w*100:4.1f}% · ناتج "
+                f"{sum(rs)/len(rs):+.3f}R · محصلة {sum(rs):+6.1f}R · تراجع {dd:4.1f}R")
+
+    out.append(f"المطبَّق الآن:        {m(rows)}")
+    for name, bands in SHADOW.items():
+        sub = [x for x in rows
+               if any(lo <= abs(x[1]) < hi for lo, hi in bands)]
+        out.append(f"{name:18}  {m(sub)}")
+    out += ["", "لا تُفعَّل قاعدة حتى تتفوّق على المطبَّق في الناتج "
+            "والتراجع معاً، وعلى 30 صفقة فأكثر."]
+    return "\n".join(out)
 
 
 def eod_text(c, ts):
@@ -635,6 +683,9 @@ def main():
             today_s = day_str(ts)
             if now_dt.hour == 23 and now_dt.minute >= 55 and last_eod != today_s:
                 say(eod_text(c, ts))
+                # الظل يُرسل أسبوعياً فقط — لا قيمة لمقارنته يومياً
+                if datetime.now(RIY).weekday() == 4:
+                    say(shadow_text(c))
                 last_eod = today_s
         except Exception:
             try:
@@ -695,6 +746,10 @@ if __name__ == "__main__":
         b, t = cd.bars()
         print(f"تحقق: {len(b)} شمعة، آخر إغلاق {b[-1]['c'] if b else '—'}")
         say("✅ تم تسجيل جهاز ClusterDelta — الذهب جاهز.")
+    elif len(sys.argv) > 1 and sys.argv[1] == "shadow":
+        c = db()
+        txt = shadow_text(c, sys.argv[2] if len(sys.argv) > 2 else None)
+        say(txt); print(txt)
     elif len(sys.argv) > 1 and sys.argv[1] == "eod":
         c = db(); txt = eod_text(c, int(time.time())); say(txt); print(txt)
     else:
