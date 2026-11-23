@@ -76,7 +76,7 @@ def fetch(inst, days):
     """
     cfg = cfg_for(inst)
     if cfg["src"] == "okx":
-        return T.okx_bars(cfg["sym"], cfg["bucket"], limit=300)
+        return okx_history(cfg["sym"], cfg["bucket"], days)
     cd = T.CD(); cd.ensure()
     out, step = {}, 25           # 25 يوماً لكل طلب (الحد ~30)
     now = int(time.time()) - OFFSET * 86400
@@ -106,6 +106,62 @@ def fetch(inst, days):
                                 "buy": buy, "sell": sell, "lv": lv}
         print(f"  …{len(out)} شمعة", flush=True)
     return [out[k] for k in sorted(out)]
+
+
+def okx_history(inst_id, bucket, days):
+    """تاريخ OKX على دفعات.
+
+    نقطة candles تعطي الأحدث فقط، والتاريخ في history-candles. و
+    taker-volume محدودة بـ100 صف لكل طلب، فنسحبها بالتقسيم أيضاً.
+    """
+    h = T.httpx.Client(timeout=30, headers={"User-Agent": "tradesys/2.0"})
+    ccy = inst_id.split("-")[0]
+    end = int(time.time() * 1000) - OFFSET * 86400000
+    cand, taker = {}, {}
+    need = days * 288                       # شمعة كل 5 دقائق
+    cur = end
+    while len(cand) < need:
+        r = h.get(f"https://www.okx.com/api/v5/market/history-candles",
+                  params={"instId": inst_id, "bar": "5m", "after": cur,
+                          "limit": 100}).json()
+        d = r.get("data") or []
+        if not d:
+            break
+        for row in d:
+            cand[int(row[0])] = row
+        cur = int(d[-1][0])
+        if len(cand) % 1000 < 100:
+            print(f"  …{len(cand)} شمعة", flush=True)
+    cur = end
+    while len(taker) < need:
+        r = h.get("https://www.okx.com/api/v5/rubik/stat/taker-volume",
+                  params={"ccy": ccy, "instType": "CONTRACTS", "period": "5m",
+                          "end": cur, "limit": 100}).json()
+        d = r.get("data") or []
+        if not d:
+            break
+        for row in d:
+            taker[int(row[0])] = (float(row[1]), float(row[2]))
+        nxt = int(d[-1][0])
+        if nxt >= cur:
+            break
+        cur = nxt
+    out = []
+    for ms in sorted(cand):
+        if ms not in taker:
+            continue
+        row = cand[ms]
+        sell, buy = taker[ms]
+        o, hi, lo, cl = (float(row[i]) for i in (1, 2, 3, 4))
+        b0 = T.math.floor(lo / bucket) * bucket
+        b1 = T.math.floor(hi / bucket) * bucket
+        n = int(round((b1 - b0) / bucket)) + 1
+        lv = {round(b0 + i * bucket, 6): (buy / n, sell / n) for i in range(n)}
+        out.append({"ts": ms // 1000, "o": o, "h": hi, "l": lo, "c": cl,
+                    "v": buy + sell, "d": buy - sell, "buy": buy, "sell": sell,
+                    "lv": lv})
+    print(f"  شمعات مطابقة: {len(out)} (سعر {len(cand)} · دلتا {len(taker)})")
+    return out
 
 
 def verify(bars):
