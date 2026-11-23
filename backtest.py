@@ -22,19 +22,64 @@ from datetime import datetime, timedelta, timezone
 
 import tradesys as T
 
-COST = float(sys.argv[3]) if len(sys.argv) > 3 else 0.04   # R لكل صفقة
+def _arg(name, default=None):
+    """--name value"""
+    if name in sys.argv:
+        i = sys.argv.index(name)
+        if i + 1 < len(sys.argv):
+            return sys.argv[i + 1]
+    return default
+
+
+COST = float(_arg("--cost", "0.04"))        # R لكل صفقة
+OFFSET = int(_arg("--offset", "0"))         # نبدأ السحب قبل اليوم بـ N يوماً
+BANDS = _arg("--bands", "")                 # مثال: 18-22,30-110
+
+# أدوات إضافية للتحقق المتقاطع — نفس عقود ClusterDelta.
+# إن صمدت قاعدة على الذهب وعلى هذه، فهي ليست خاصية أداة واحدة.
+EXTRA = {
+    "ES":  {"src": "cd", "sym": "es",  "bucket": 0.25, "max": 4, "hours": "gold", "name": "ES"},
+    "NQ":  {"src": "cd", "sym": "nq",  "bucket": 0.25, "max": 4, "hours": "gold", "name": "NQ"},
+    "CL":  {"src": "cd", "sym": "cl",  "bucket": 0.01, "max": 4, "hours": "gold", "name": "CL"},
+    "SI":  {"src": "cd", "sym": "si",  "bucket": 0.005, "max": 4, "hours": "gold", "name": "SI"},
+    "MGC": {"src": "cd", "sym": "mgc", "bucket": 0.1, "max": 4, "hours": "gold", "name": "MGC"},
+}
+
+
+def cfg_for(inst):
+    return T.INSTRUMENTS.get(inst) or EXTRA[inst]
+
+
+def parse_bands(spec):
+    """'18-22,30-110' -> [(0.18,0.22),(0.30,1.10)]"""
+    out = []
+    for part in spec.split(","):
+        part = part.strip()
+        if not part:
+            continue
+        a, _, b = part.partition("-")
+        out.append((float(a) / 100, float(b) / 100))
+    return out
+
+
+def in_bands(d, bands):
+    return any(lo <= abs(d) < hi for lo, hi in bands)
 ENTRY_WINDOW = 12        # شمعات مهلة تحقق دخول الارتداد
 MAX_HOLD = 96
 
 
 def fetch(inst, days):
-    """سحب التاريخ على دفعات — ClusterDelta تحدّ النافذة لا التاريخ."""
-    cfg = T.INSTRUMENTS[inst]
+    """سحب التاريخ على دفعات — ClusterDelta تحدّ النافذة لا التاريخ.
+
+    OFFSET يزيح نافذة السحب للخلف، فنحصل على فترة لم تُستخدم في أي ضبط
+    سابق — وهذا شرط التحقق النظيف.
+    """
+    cfg = cfg_for(inst)
     if cfg["src"] == "okx":
         return T.okx_bars(cfg["sym"], cfg["bucket"], limit=300)
     cd = T.CD(); cd.ensure()
     out, step = {}, 25           # 25 يوماً لكل طلب (الحد ~30)
-    now = int(time.time())
+    now = int(time.time()) - OFFSET * 86400
     for off in range(0, days, step):
         to = now - off * 86400
         frm = to - step * 86400
@@ -115,7 +160,7 @@ def stats(trades):
             "dd": round(dd, 1), "streak": worst}
 
 
-def run(bars, cfg, rules=True):
+def run(bars, cfg, rules=True, bands=None):
     """يُعيد قائمة الصفقات. rules=True يطبّق حدود المخاطرة اليومية."""
     trades = []
     day = None; dr = 0.0; n = 0; cs = 0
@@ -123,6 +168,8 @@ def run(bars, cfg, rules=True):
         w = bars[max(0, i + 1 - T.WIN):i + 1]
         sig, _ = T.propose(w)
         if not sig:
+            continue
+        if bands and not in_bands(sig["delta"], bands):
             continue
         d = T.day_str(bars[i]["ts"])
         if d != day:
@@ -153,8 +200,9 @@ def line(name, s):
 
 def main():
     inst = sys.argv[1] if len(sys.argv) > 1 else "GC"
-    days = int(sys.argv[2]) if len(sys.argv) > 2 else 90
-    cfg = T.INSTRUMENTS[inst]
+    days = int(sys.argv[2]) if len(sys.argv) > 2 and sys.argv[2].isdigit() else 90
+    cfg = cfg_for(inst)
+    bands = parse_bands(BANDS) if BANDS else None
     print(f"سحب {cfg['name']} — {days} يوماً…", flush=True)
     bars = fetch(inst, days)
     if len(bars) < T.WIN * 3:
@@ -166,11 +214,15 @@ def main():
     if bad:
         print("تحذير: بيانات غير متسقة — النتيجة مشكوك فيها")
 
-    print(f"\nالتكاليف {COST}R/صفقة · نافذة القرار {T.WIN} شمعة (نفس الإنتاج)")
+    print(f"\nالتكاليف {COST}R/صفقة · نافذة القرار {T.WIN} شمعة (نفس الإنتاج)"
+          + (f" · إزاحة {OFFSET} يوماً" if OFFSET else "")
+          + (f" · نطاقات {BANDS}" if bands else ""))
     print("\n=== الأساس ===")
     print(line("بلا قواعد مخاطرة", stats(run(bars, cfg, rules=False))))
     full = run(bars, cfg, rules=True)
     print(line("بقواعد المخاطرة", stats(full)))
+    if bands:
+        print(line(f"+ نطاقات {BANDS}", stats(run(bars, cfg, True, bands))))
 
     cut = bars[0]["ts"] + int((bars[-1]["ts"] - bars[0]["ts"]) * 0.67)
     print(f"\n=== تحقق زمني (ضبط حتى {f(cut)}) ===")
