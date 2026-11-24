@@ -30,7 +30,7 @@ INSTRUMENTS = {
     # tick: قيمة النقطة الواحدة بالدولار. pts: هدف النقاط التراكمي لليوم
     # (0 = لا هدف نقاط). rtarget: هدف اليوم بالـ R.
     "GC": {"src": "cd", "sym": "gc", "bucket": 0.1, "max": 6,
-           "hours": "cme", "tick": 0.1, "pts": 600, "rtarget": 6.0,
+           "hours": "cme", "tick": 0.1, "pts": 300, "rtarget": 6.0,
            "name": "الذهب GC"},
     "BTC": {"src": "okx", "sym": "BTC-USDT-SWAP", "bucket": 10.0, "max": 6,
             "hours": "24/7", "tick": 1.0, "pts": 0, "rtarget": 6.0,
@@ -684,30 +684,67 @@ def archive(c, inst, bars):
         pass
 
 
-def update(c, inst, bars):
+def update(c, inst, bars, cfg=None):
+    """يتتبّع الصفقات المفتوحة ويُنبّه عند كل تحوّل.
+
+    التنبيه يُرسل لحظة اكتشاف التحوّل من الشمعة التي حققته، ويُذكر وقت تلك
+    الشمعة لا وقت الإرسال — الفرق قد يبلغ خمس دقائق، وإخفاؤه يضلّل.
+    """
+    cfg = cfg or INSTRUMENTS.get(inst, {})
+    nm = cfg.get("name", inst)
+    bk = cfg.get("bucket", 0.1)
+    tick = cfg.get("tick") or 0.1
+    ar = lambda s: "شراء" if s == "buy" else "بيع"
     rows = c.execute("SELECT id,ts,side,entry,stop,t1,status FROM sig "
                      "WHERE inst=? AND status IN ('pending','active')",
                      (inst,)).fetchall()
+    alerts = []
     for sid, ts, side, entry, stop, t1, st in rows:
         nb = [b for b in bars if b["ts"] > ts]
         for b in nb:
+            at = now_riy(b["ts"])
             if st == "pending":
                 if b["l"] <= entry <= b["h"]:
                     st = "active"
                     c.execute("UPDATE sig SET status='active' WHERE id=?", (sid,))
+                    alerts.append(
+                        f"🔵 دخول — {nm}\n{at} الرياض\n\n"
+                        f"السعر لمس نقطة الدخول {_fmt(entry, bk)} ({ar(side)}).\n"
+                        f"الصفقة قائمة الآن.\n"
+                        f"الستوب {_fmt(stop, bk)} · الهدف الأول {_fmt(t1, bk)}")
                 elif b["ts"] - ts > 12 * TF * 60:
-                    c.execute("UPDATE sig SET status='not_filled',r=0 WHERE id=?", (sid,))
+                    c.execute("UPDATE sig SET status='not_filled',r=0 WHERE id=?",
+                              (sid,))
+                    alerts.append(
+                        f"⚪️ خروج بلا تنفيذ — {nm}\n{at} الرياض\n\n"
+                        f"مضت ساعة ولم يعد السعر إلى {_fmt(entry, bk)}.\n"
+                        f"أُلغيت الإشارة · 0.00R · لا ربح ولا خسارة.")
                     break
                 else:
                     continue
             hs = b["l"] <= stop if side == "buy" else b["h"] >= stop
             ht = b["h"] >= t1 if side == "buy" else b["l"] <= t1
             if hs:      # الستوب يفوز عند الالتباس داخل الشمعة
-                c.execute("UPDATE sig SET status='stop',r=-1 WHERE id=?", (sid,)); break
+                c.execute("UPDATE sig SET status='stop',r=-1 WHERE id=?", (sid,))
+                alerts.append(
+                    f"🔴 ستوب — {nm}\n{at} الرياض\n\n"
+                    f"السعر ضرب {_fmt(stop, bk)}.\n"
+                    f"الخروج تم · −1.00R · "
+                    f"{abs(entry-stop)/tick:.0f} نقطة خسارة.")
+                break
             if ht:
                 r = round(abs(t1 - entry) / abs(entry - stop), 2)
-                c.execute("UPDATE sig SET status='target',r=? WHERE id=?", (r, sid)); break
+                c.execute("UPDATE sig SET status='target',r=? WHERE id=?", (r, sid))
+                alerts.append(
+                    f"🟢 الهدف تحقق — {nm}\n{at} الرياض\n\n"
+                    f"السعر بلغ الهدف الأول {_fmt(t1, bk)}.\n"
+                    f"الخروج تم · +{r:.2f}R · "
+                    f"{abs(t1-entry)/tick:.0f} نقطة ربح.")
+                break
     c.commit()
+    for a in alerts:          # الإرسال بعد الحفظ: لا تنبيه عن حالة لم تُثبَّت
+        try: say(a)
+        except Exception: pass
 
 
 # ── النصوص ─────────────────────────────────────────────────────────────
@@ -795,7 +832,7 @@ def scan(c, cd, ts, inst, cfg):
         bars = okx_bars(cfg["sym"], cfg["bucket"])
     cfg["_bars"] = bars
     archive(c, inst, bars)
-    update(c, inst, bars)
+    update(c, inst, bars, cfg)
     bad = integrity(bars, ts)
     if bad:
         return False, None, "، ".join(bad), bad
