@@ -27,22 +27,27 @@ OKX    = "https://www.okx.com/api/v5"
 
 # أداتان، مصدران. ClusterDelta عقود آجلة فقط ولا تضمّ البتكوين.
 INSTRUMENTS = {
-    "GC": {"src": "cd", "sym": "gc", "bucket": 0.1, "max": 4,
-           "hours": "cme", "day": "cme", "name": "الذهب GC"},
-    "BTC": {"src": "okx", "sym": "BTC-USDT-SWAP", "bucket": 10.0, "max": 5,
-            "hours": "24/7", "day": "riyadh", "name": "البتكوين"},
+    # tick: قيمة النقطة الواحدة بالدولار. pts: هدف النقاط التراكمي لليوم
+    # (0 = لا هدف نقاط). rtarget: هدف اليوم بالـ R.
+    "GC": {"src": "cd", "sym": "gc", "bucket": 0.1, "max": 6,
+           "hours": "cme", "tick": 0.1, "pts": 600, "rtarget": 6.0,
+           "name": "الذهب GC"},
+    "BTC": {"src": "okx", "sym": "BTC-USDT-SWAP", "bucket": 10.0, "max": 6,
+            "hours": "24/7", "tick": 1.0, "pts": 0, "rtarget": 6.0,
+            "name": "البتكوين"},
 }
 WIN    = 36                # نافذة القرار: 3 ساعات (نفس نافذة الاختبار)
 DELTA_MIN   = 0.18         # بوابة الدلتا
 RR_MIN      = 2.0
 MAX_TRADES  = 4
 LOSS_CAP    = -2.0
-DAY_TARGET  = 3.0
+DAY_TARGET  = 6.0         # افتراضي؛ كل أداة تتجاوزه بـ rtarget
 MAX_CONSEC  = 2
 MAX_AGE     = 900          # عمر آخر شمعة خمسية (ثانية)
 SCAN        = 300
 RIY = timezone(timedelta(hours=3))
 CHI = ZoneInfo("America/Chicago")   # مرجع جلسة CME — يتبع التوقيت الصيفي تلقائياً
+LON = ZoneInfo("Europe/London")     # بداية يوم التداول: افتتاح لندن 08:00
 GROQ_KEY   = os.getenv("GROQ_KEY", "")
 GROQ_MODEL = os.getenv("GROQ_MODEL", "openai/gpt-oss-120b")
 
@@ -539,27 +544,21 @@ def session_name(ts):
     return "—"
 
 
-def trade_day(ts, cfg):
-    """بداية ونهاية اليوم كما يراها كل أداة.
+def trade_day(ts, cfg=None):
+    """يوم التداول يبدأ عند افتتاح لندن 08:00 بتوقيت لندن.
 
-    الذهب: يوم جلسة CME — يدور عند 17:00 شيكاغو (نحو 01:00–02:00 الرياض)،
-    فلا تُصفَّر العدادات في منتصف جلسة واحدة.
-    البتكوين: السوق مفتوح دائماً فلا جلسة تحكمه — يدور عند منتصف ليل الرياض،
-    أي يوم محمد نفسه.
+    ليس منتصف الليل: جلسة آسيا قبل لندن امتداد لليوم السابق في سلوك السعر،
+    وفصلها عند منتصف ليل الرياض كان يقطع الحركة نصفين. المرجع بتوقيت لندن
+    لا الرياض، فيتبع التوقيت الصيفي البريطاني تلقائياً.
     """
-    if cfg.get("day") == "cme":
-        return (datetime.fromtimestamp(ts, CHI)
-                + timedelta(hours=7)).strftime("%Y-%m-%d")
-    return datetime.fromtimestamp(ts, RIY).strftime("%Y-%m-%d")
+    return (datetime.fromtimestamp(ts, LON)
+            - timedelta(hours=8)).strftime("%Y-%m-%d")
 
 
-def day_ends_now(ts, cfg):
-    """هل نحن في نافذة نهاية يوم هذه الأداة؟ (خمس دقائق)"""
-    if cfg.get("day") == "cme":
-        t = datetime.fromtimestamp(ts, CHI)       # الإغلاق 16:00 شيكاغو
-        return t.weekday() not in (5, 6) and t.hour == 16 and t.minute < 5
-    t = datetime.fromtimestamp(ts, RIY)           # 23:55 الرياض
-    return t.hour == 23 and t.minute >= 55
+def day_ends_now(ts, cfg=None):
+    """نافذة نهاية اليوم: الدقائق الخمس قبل افتتاح لندن."""
+    t = datetime.fromtimestamp(ts, LON)
+    return t.hour == 7 and t.minute >= 55
 
 
 # ── المحرّك ────────────────────────────────────────────────────────────
@@ -619,6 +618,13 @@ def db():
     if "inst" not in cols:
         c.execute("ALTER TABLE sig ADD COLUMN inst TEXT")
         c.execute("UPDATE sig SET inst='GC' WHERE inst IS NULL")
+    # ترحيل حدّ اليوم إلى افتتاح لندن: الصفوف القديمة كُتبت بحدّ منتصف
+    # الليل، فتُعاد تسميتها من طابعها الزمني. عملية متكررة بلا أثر جانبي،
+    # ولا تمسّ أي نتيجة — الحدّ فقط هو ما تغيّر.
+    fix = [(trade_day(t), i) for i, t in
+           c.execute("SELECT id,ts FROM sig").fetchall()]
+    c.executemany("UPDATE sig SET day=? WHERE id=? AND day<>?",
+                  [(d, i, d) for d, i in fix])
     c.commit()
     return c
 
@@ -628,28 +634,39 @@ def day_str(ts):
 
 
 def ledger(c, ts, inst, cfg=None):
-    d = trade_day(ts, cfg or INSTRUMENTS[inst])
-    rows = c.execute("SELECT status,r FROM sig WHERE day=? AND inst=? ORDER BY ts",
-                     (d, inst)).fetchall()
+    cfg = cfg or INSTRUMENTS[inst]
+    d = trade_day(ts)
+    rows = c.execute("SELECT status,r,entry,stop FROM sig "
+                     "WHERE day=? AND inst=? ORDER BY ts", (d, inst)).fetchall()
     sent = len(rows)
     done = [x for x in rows if x[0] in ("target", "stop")]
     rr = sum(x[1] or 0 for x in done)
+    # النقاط التراكمية: R مضروبة في مسافة المخاطرة تعطي حركة السعر الفعلية،
+    # مقسومة على قيمة النقطة. هكذا يُقاس الهدف بالنقاط لا بالـ R وحدها.
+    tick = cfg.get("tick") or 0.1
+    pts = sum((x[1] or 0) * abs((x[2] or 0) - (x[3] or 0)) for x in done) / tick
     cs = 0
-    for s, r in done:
+    for s, r, _e, _s in done:
         cs = cs + 1 if (r or 0) < 0 else 0
     # الصفقة القائمة تُقاس بلا قيد يوم: صفقة فُتحت قبل دوران اليوم
     # ما زالت قائمة، ولو قيّدناها باليوم لسمحنا بالتكديس فوقها.
     openp = c.execute("SELECT 1 FROM sig WHERE inst=? AND "
                       "status IN ('pending','active') LIMIT 1",
                       (inst,)).fetchone() is not None
-    return {"sent": sent, "r": rr, "consec": cs, "open": openp, "day": d}
+    return {"sent": sent, "r": rr, "pts": pts, "consec": cs,
+            "open": openp, "day": d}
 
 
-def risk_block(l, mx):
+def risk_block(l, mx, cfg=None):
+    cfg = cfg or {}
+    rt = cfg.get("rtarget", DAY_TARGET)
+    pt = cfg.get("pts", 0)
     if l["open"]:       return "صفقة قائمة — لا تكديس"
     if l["sent"] >= mx: return f"بلغنا {mx} صفقات اليوم"
     if l["r"] <= LOSS_CAP:   return f"سقف الخسارة اليومي {LOSS_CAP}R"
-    if l["r"] >= DAY_TARGET: return f"تحقق هدف اليوم +{DAY_TARGET}R"
+    if l["r"] >= rt:    return f"تحقق هدف اليوم +{rt}R"
+    if pt and l.get("pts", 0) >= pt:
+        return f"تحقق هدف اليوم {pt} نقطة ({l['pts']:.0f})"
     if l["consec"] >= MAX_CONSEC: return "خسارتان متتاليتان — توقف"
     return None
 
@@ -710,7 +727,8 @@ def sig_text(s, l, ts, cfg):
             f"بإغلاق، دلتا {s['delta']*100:+.1f}%\n"
             f"البروفايل: VAL {s['val']:,.1f} · POC {s['poc']:,.1f} · VAH {s['vah']:,.1f}\n"
             f"المدى (8 شمعات): {s['range']}\n\n"
-            f"يوم {l['day']}: {l['sent']+1}/{cfg['max']} · المحقق {l['r']:+.2f}R\n"
+            f"يوم {l['day']}: {l['sent']+1}/{cfg['max']} · المحقق {l['r']:+.2f}R"
+            + (f" · {l['pts']:+.0f} نقطة" if cfg.get('pts') else "") + "\n"
             f"الستوب إلزامي. النظام لا ينفّذ — القرار لك.")
 
 
@@ -724,7 +742,8 @@ def hour_text(ctx, why, l, bad, ts, cfg):
               f"POC {ctx['poc']:,.1f} | VAH {ctx['vah']:,.1f} | VAL {ctx['val']:,.1f}"]
     x += ["", f"لا صفقة: {why}"]
     x += ["سلامة البيانات: " + ("سليمة" if not bad else " / ".join(bad))]
-    x += ["", f"يوم {l['day']}: {l['sent']}/{cfg['max']} صفقات · المحقق {l['r']:+.2f}R"]
+    x += ["", f"يوم {l['day']}: {l['sent']}/{cfg['max']} صفقات · "
+          f"المحقق {l['r']:+.2f}R" + (f" · {l['pts']:+.0f} نقطة" if cfg.get('pts') else "")]
     x += ["ملاحظة: لا سعر مرجعي مستقل — التحقق داخلي فقط" if cfg["src"] == "cd"
           else "ملاحظة: دلتا OKX حقيقية لكل 5 دقائق، وتوزيعها على المستويات تقريبي",
           news_line()]
@@ -781,7 +800,7 @@ def scan(c, cd, ts, inst, cfg):
     if bad:
         return False, None, "، ".join(bad), bad
     l = ledger(c, ts, inst, cfg)
-    blk = risk_block(l, cfg["max"]) or news_block(ts)
+    blk = risk_block(l, cfg["max"], cfg) or news_block(ts)
     s, why = propose(bars)
     ctx = s
     if not s:
@@ -854,7 +873,8 @@ def shadow_text(c, inst=None):
 
 def eod_text(c, ts, inst, cfg):
     """تقرير يوم أداة واحدة، عند نهاية يومها هي لا نهاية يوم غيرها."""
-    day = trade_day(ts, cfg)
+    day = trade_day(ts)
+    led = ledger(c, ts, inst, cfg)
     rows = c.execute("SELECT status, r FROM sig WHERE day=? AND inst=?",
                      (day, inst)).fetchall()
     n = len(rows)
@@ -863,7 +883,8 @@ def eod_text(c, ts, inst, cfg):
     losses = sum(1 for x in rows if (x[1] or 0) < 0)
     pend = sum(1 for x in rows if x[0] in ("pending", "active"))
     nf = sum(1 for x in rows if x[0] == "not_filled")
-    lines = [f"📊 نهاية اليوم — {cfg['name']}", f"{day} · أُغلق {now_riy(ts)} الرياض", ""]
+    lines = [f"📊 نهاية اليوم — {cfg['name']}",
+             f"{day} · من افتتاح لندن إلى افتتاح لندن", ""]
     if not n:
         lines.append("لا إشارات اليوم — الالتزام بالقواعد لا تقصير.")
     else:
@@ -871,8 +892,10 @@ def eod_text(c, ts, inst, cfg):
                   f"ربح {wins} · خسارة {losses}"
                   + (f" · لم تُنفَّذ {nf}" if nf else "")
                   + (f" · ما زالت قائمة {pend}" if pend else ""),
-                  f"الصافي: {r_sum:+.2f}R"]
-    lines += ["", "العدادات صُفِّرت — يوم جديد يبدأ الآن."]
+                  f"الصافي: {r_sum:+.2f}R"
+                  + (f" · {led['pts']:+.0f} نقطة من {cfg['pts']}"
+                     if cfg.get("pts") else "")]
+    lines += ["", "العدادات صُفِّرت — يوم جديد يبدأ مع افتتاح لندن."]
     return "\n".join(lines)
 
 def main():
@@ -928,17 +951,21 @@ def main():
                         say(msg)
                 last_hour = hr
                 sent = {k: False for k in INSTRUMENTS}
-            # كل أداة تُقفل يومها وحدها: الذهب عند إغلاق جلسة CME،
-            # والبتكوين عند منتصف ليل الرياض.
-            for inst, cfg in INSTRUMENTS.items():
-                d = trade_day(ts, cfg)
-                if day_ends_now(ts, cfg) and last_eod.get(inst) != d:
-                    say(eod_text(c, ts, inst, cfg))
+            # اليوم يُقفل قبيل افتتاح لندن: رسالة لكل أداة.
+            # يوم بلا إشارات والسوق مغلق (عطلة نهاية الأسبوع) لا يستحق رسالة.
+            if day_ends_now(ts):
+                d = trade_day(ts)
+                for inst, cfg in INSTRUMENTS.items():
+                    if last_eod.get(inst) == d:
+                        continue
+                    led = ledger(c, ts, inst, cfg)
+                    if led["sent"] or is_open(cfg, ts):
+                        say(eod_text(c, ts, inst, cfg))
                     last_eod[inst] = d
             # الظل يُرسل أسبوعياً فقط — لا قيمة لمقارنته يومياً
             wk_s = datetime.fromtimestamp(ts, RIY).strftime("%G-W%V")
-            if day_ends_now(ts, INSTRUMENTS["GC"]) and \
-                    datetime.fromtimestamp(ts, CHI).weekday() == 4 and \
+            if day_ends_now(ts) and \
+                    datetime.fromtimestamp(ts, LON).weekday() == 5 and \
                     last_shadow != wk_s:
                 say(shadow_text(c))
                 last_shadow = wk_s
@@ -970,7 +997,7 @@ if __name__ == "__main__":
                     sig, why = propose(bars)
                     w = bars[-WIN:]; pr = profile(w)
                     led = ledger(c, ts, inst, cfg)
-                    blk = risk_block(led, cfg["max"]) or news_block(ts)
+                    blk = risk_block(led, cfg["max"], cfg) or news_block(ts)
                     x += [f"{len(bars)} شمعة",
                           f"السعر {w[-1]['c']:,.1f} · دلتا "
                           f"{delta_ratio(w[-1])*100:+.1f}% · مدى {rng(w):,.2f}",
@@ -981,7 +1008,8 @@ if __name__ == "__main__":
                               f"إشارة {sig['side']} دخول {sig['entry']:,.1f} "
                               f"ستوب {sig['stop']:,.1f} R:R 1:{sig['rr']}"
                               if sig and not blk else (blk or why)),
-                          f"يوم {led['day']}: {led['sent']}/{cfg['max']} · {led['r']:+.2f}R",
+                          f"يوم {led['day']}: {led['sent']}/{cfg['max']} · {led['r']:+.2f}R"
+                          + (f" · {led['pts']:+.0f} نقطة" if cfg.get('pts') else ""),
                           news_line()]
                     a = analyze(cfg, bars, sig if not blk else None, blk or why, cd)
                     if a:

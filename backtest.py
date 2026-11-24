@@ -253,7 +253,9 @@ def stats(trades):
 def run(bars, cfg, rules=True, bands=None, scale=False):
     """يُعيد قائمة الصفقات. rules=True يطبّق حدود المخاطرة اليومية."""
     trades = []
-    day = None; dr = 0.0; n = 0; cs = 0
+    day = None; dr = 0.0; n = 0; cs = 0; dp = 0.0
+    tick = cfg.get("tick") or 0.1
+    rt = cfg.get("rtarget", T.DAY_TARGET); ptgt = cfg.get("pts", 0)
     for i in range(T.WIN, len(bars) - 1):
         w = bars[max(0, i + 1 - T.WIN):i + 1]
         sig, _ = T.propose(w)
@@ -261,11 +263,11 @@ def run(bars, cfg, rules=True, bands=None, scale=False):
             continue
         if bands and not in_bands(sig["delta"], bands):
             continue
-        d = T.day_str(bars[i]["ts"])
+        d = T.trade_day(bars[i]["ts"])
         if d != day:
-            day, dr, n, cs = d, 0.0, 0, 0
-        if rules and (n >= cfg["max"] or dr <= T.LOSS_CAP
-                      or dr >= T.DAY_TARGET or cs >= T.MAX_CONSEC):
+            day, dr, n, cs, dp = d, 0.0, 0, 0, 0.0
+        if rules and (n >= cfg["max"] or dr <= T.LOSS_CAP or dr >= rt
+                      or (ptgt and dp >= ptgt) or cs >= T.MAX_CONSEC):
             continue
         o = outcome(bars, i, sig, scale=scale)
         if not o:
@@ -273,6 +275,7 @@ def run(bars, cfg, rules=True, bands=None, scale=False):
         n += 1
         if o["st"] in ("stop", "target"):
             dr += o["r"]
+            dp += o["r"] * abs(sig["entry"] - sig["stop"]) / tick
             cs = cs + 1 if o["r"] < 0 else 0
         trades.append({**o, "ts": bars[i]["ts"], "side": sig["side"],
                        "rr": sig["rr"], "delta": sig["delta"],
