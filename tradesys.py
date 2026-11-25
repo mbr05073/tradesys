@@ -29,13 +29,23 @@ OKX    = "https://www.okx.com/api/v5"
 INSTRUMENTS = {
     # tick: قيمة النقطة الواحدة بالدولار. pts: هدف النقاط التراكمي لليوم
     # (0 = لا هدف نقاط). rtarget: هدف اليوم بالـ R.
+    # offset: فرق سعر منصّة محمد عن سعر هذا المصدر، موقّعاً.
+    #   سعري = سعر المصدر + offset.  الذهب: GC الآجل أدنى من XAUUSD بـ$10.
+    #   يُضبط من البيئة بلا تعديل كود، ويُعاد قياسه عند تدوير العقد.
     "GC": {"src": "cd", "sym": "gc", "bucket": 0.1, "max": 6,
            "hours": "cme", "tick": 0.1, "pts": 300, "rtarget": 6.0,
+           "offset": float(os.getenv("GC_OFFSET", "10.0")),
+           "offset_date": os.getenv("GC_OFFSET_DATE", ""),
+           "mine": "XAUUSD", "ref": "GC",
            "name": "الذهب GC"},
     "BTC": {"src": "okx", "sym": "BTC-USDT-SWAP", "bucket": 10.0, "max": 6,
             "hours": "24/7", "tick": 1.0, "pts": 0, "rtarget": 6.0,
+            "offset": float(os.getenv("BTC_OFFSET", "0.0")),
+            "offset_date": os.getenv("BTC_OFFSET_DATE", ""),
+            "mine": "", "ref": "",
             "name": "البتكوين"},
 }
+OFFSET_MAX_AGE = 10        # أيام قبل المطالبة بإعادة قياس الفرق
 WIN    = 36                # نافذة القرار: 3 ساعات (نفس نافذة الاختبار)
 DELTA_MIN   = 0.18         # بوابة الدلتا
 RR_MIN      = 2.0
@@ -302,6 +312,43 @@ def _dec(bucket):
 
 def _fmt(p, bucket):
     return f"{p:,.{_dec(bucket)}f}"
+
+
+def my_px(p, cfg):
+    """سعر منصّة محمد المقابل لسعر المصدر."""
+    return p + float(cfg.get("offset") or 0.0)
+
+
+def px(p, cfg):
+    """رقم للإرسال: سعر المنصّة أولاً، وسعر المصدر بين قوسين عند اختلافهما.
+
+    التحليل كله يجري على سعر المصدر؛ هذه الدالة للعرض وحده. إخفاء سعر
+    المصدر يمنع التحقق، وإخفاء سعر المنصّة يجعل الرقم غير قابل للتنفيذ.
+    """
+    bk = cfg.get("bucket", 0.1)
+    off = float(cfg.get("offset") or 0.0)
+    if not off:
+        return _fmt(p, bk)
+    return f"{_fmt(my_px(p, cfg), bk)} ({cfg.get('ref') or 'المصدر'} {_fmt(p, bk)})"
+
+
+def offset_warn(cfg):
+    """تحذير إذا شاخ قياس الفرق — الأساس يتغيّر، ويقفز عند تدوير العقد."""
+    off = float(cfg.get("offset") or 0.0)
+    if not off:
+        return ""
+    d = (cfg.get("offset_date") or "").strip()
+    if not d:
+        return (f"\n⚠️ الفرق {off:+.1f}$ غير مؤرّخ — قِسه الآن من منصّتك "
+                f"وحدّث GC_OFFSET_DATE.")
+    try:
+        age = (datetime.now(RIY).date() - datetime.strptime(d, "%Y-%m-%d").date()).days
+    except ValueError:
+        return f"\n⚠️ GC_OFFSET_DATE غير صالح ({d})."
+    if age > OFFSET_MAX_AGE:
+        return (f"\n⚠️ الفرق {off:+.1f}$ مقاس قبل {age} يوماً. أعد قياسه — "
+                f"الأساس يتغيّر ويقفز عند تدوير العقد.")
+    return ""
 
 
 def footprint_text(b, bucket):
@@ -607,6 +654,12 @@ def db():
     c.execute("""CREATE TABLE IF NOT EXISTS sig(
         id INTEGER PRIMARY KEY, ts INT, day TEXT, inst TEXT, side TEXT, entry REAL,
         stop REAL, t1 REAL, t2 REAL, t3 REAL, rr REAL, status TEXT, r REAL)""")
+    # النصف الثاني بعد الخروج الجزئي عند T1. جدول مستقل بقصد: حساب الـR
+    # وبوابة المخاطرة تبقى على القاعدة المختبرة (خروج كامل عند T1)، وهذا
+    # يسجّل أثر الاستمرار وحده حتى تُحكم عليه 30 حالة بأرقامها.
+    c.execute("""CREATE TABLE IF NOT EXISTS runner(
+        id INTEGER PRIMARY KEY, sid INT, ts INT, day TEXT, inst TEXT,
+        side TEXT, be REAL, t2 REAL, risk REAL, status TEXT, r REAL)""")
     # أرشيف الشمعات — OKX لا تعطي تاريخ الدلتا، فنبنيه بأنفسنا.
     c.execute("""CREATE TABLE IF NOT EXISTS bar(
         inst TEXT, ts INT, o REAL, h REAL, l REAL, c REAL,
@@ -695,11 +748,12 @@ def update(c, inst, bars, cfg=None):
     bk = cfg.get("bucket", 0.1)
     tick = cfg.get("tick") or 0.1
     ar = lambda s: "شراء" if s == "buy" else "بيع"
-    rows = c.execute("SELECT id,ts,side,entry,stop,t1,status FROM sig "
+    wrn = offset_warn(cfg)
+    rows = c.execute("SELECT id,ts,side,entry,stop,t1,t2,status FROM sig "
                      "WHERE inst=? AND status IN ('pending','active')",
                      (inst,)).fetchall()
     alerts = []
-    for sid, ts, side, entry, stop, t1, st in rows:
+    for sid, ts, side, entry, stop, t1, t2, st in rows:
         nb = [b for b in bars if b["ts"] > ts]
         for b in nb:
             at = now_riy(b["ts"])
@@ -709,15 +763,16 @@ def update(c, inst, bars, cfg=None):
                     c.execute("UPDATE sig SET status='active' WHERE id=?", (sid,))
                     alerts.append(
                         f"🔵 دخول — {nm}\n{at} الرياض\n\n"
-                        f"السعر لمس نقطة الدخول {_fmt(entry, bk)} ({ar(side)}).\n"
+                        f"{ar(side)} — السعر لمس نقطة الدخول {px(entry, cfg)}.\n"
                         f"الصفقة قائمة الآن.\n"
-                        f"الستوب {_fmt(stop, bk)} · الهدف الأول {_fmt(t1, bk)}")
+                        f"الستوب {px(stop, cfg)} · الهدف الأول {px(t1, cfg)}"
+                        + wrn)
                 elif b["ts"] - ts > 12 * TF * 60:
                     c.execute("UPDATE sig SET status='not_filled',r=0 WHERE id=?",
                               (sid,))
                     alerts.append(
                         f"⚪️ خروج بلا تنفيذ — {nm}\n{at} الرياض\n\n"
-                        f"مضت ساعة ولم يعد السعر إلى {_fmt(entry, bk)}.\n"
+                        f"مضت ساعة ولم يعد السعر إلى {px(entry, cfg)}.\n"
                         f"أُلغيت الإشارة · 0.00R · لا ربح ولا خسارة.")
                     break
                 else:
@@ -728,21 +783,68 @@ def update(c, inst, bars, cfg=None):
                 c.execute("UPDATE sig SET status='stop',r=-1 WHERE id=?", (sid,))
                 alerts.append(
                     f"🔴 ستوب — {nm}\n{at} الرياض\n\n"
-                    f"السعر ضرب {_fmt(stop, bk)}.\n"
+                    f"السعر ضرب {px(stop, cfg)}.\n"
                     f"الخروج تم · −1.00R · "
                     f"{abs(entry-stop)/tick:.0f} نقطة خسارة.")
                 break
             if ht:
-                r = round(abs(t1 - entry) / abs(entry - stop), 2)
+                risk = abs(entry - stop)
+                r = round(abs(t1 - entry) / risk, 2)
                 c.execute("UPDATE sig SET status='target',r=? WHERE id=?", (r, sid))
+                # النصف الثاني: ستوبه التعادل وهدفه T2. يُسجَّل ولا يدخل
+                # حساب اليوم — القاعدة المختبرة هي الخروج الكامل هنا.
+                c.execute("INSERT INTO runner(sid,ts,day,inst,side,be,t2,risk,"
+                          "status,r) VALUES(?,?,?,?,?,?,?,?,'open',NULL)",
+                          (sid, b["ts"], trade_day(b["ts"], cfg), inst, side,
+                           entry, t2, risk))
                 alerts.append(
-                    f"🟢 الهدف تحقق — {nm}\n{at} الرياض\n\n"
-                    f"السعر بلغ الهدف الأول {_fmt(t1, bk)}.\n"
-                    f"الخروج تم · +{r:.2f}R · "
-                    f"{abs(t1-entry)/tick:.0f} نقطة ربح.")
+                    f"🟢 الهدف الأول — {nm}\n{at} الرياض\n\n"
+                    f"السعر بلغ {px(t1, cfg)}.\n\n"
+                    f"▸ أغلق نصف الصفقة الآن · +{r/2:.2f}R مثبّتة\n"
+                    f"▸ انقل ستوب النصف الباقي إلى التعادل {px(entry, cfg)}\n"
+                    f"▸ هدف النصف الباقي {px(t2, cfg)}\n\n"
+                    f"حساب اليوم يسجّل +{r:.2f}R (القاعدة المختبرة: خروج كامل "
+                    f"هنا). النصف الباقي يُتابَع للدراسة ولا يُحسب عليك."
+                    + wrn)
                 break
     c.commit()
     for a in alerts:          # الإرسال بعد الحفظ: لا تنبيه عن حالة لم تُثبَّت
+        try: say(a)
+        except Exception: pass
+    update_runner(c, inst, bars, cfg)
+
+
+def update_runner(c, inst, bars, cfg):
+    """النصف الباقي بعد الخروج الجزئي: ستوبه التعادل وهدفه T2.
+
+    نتيجته تُسجَّل في جدول runner وحده. لا تمسّ ledger ولا بوابة المخاطرة،
+    فالحافة المثبتة بالاختبار مبنية على الخروج الكامل عند T1 — وهذه
+    المقارنة هي ما يحكم على الخروج الجزئي بعد 30 حالة.
+    """
+    nm = cfg.get("name", inst)
+    rows = c.execute("SELECT id,ts,side,be,t2,risk FROM runner "
+                     "WHERE inst=? AND status='open'", (inst,)).fetchall()
+    out = []
+    for rid, ts, side, be, t2, risk in rows:
+        for b in [x for x in bars if x["ts"] > ts]:
+            at = now_riy(b["ts"])
+            hb = b["l"] <= be if side == "buy" else b["h"] >= be
+            h2 = b["h"] >= t2 if side == "buy" else b["l"] <= t2
+            if hb:            # التعادل يفوز عند الالتباس داخل الشمعة
+                c.execute("UPDATE runner SET status='be',r=0 WHERE id=?", (rid,))
+                out.append(f"⚪️ النصف الباقي — {nm}\n{at} الرياض\n\n"
+                           f"رجع السعر إلى التعادل {px(be, cfg)}.\n"
+                           f"أُغلق النصف على صفر. المثبّت من الهدف الأول محفوظ.")
+                break
+            if h2:
+                rr = round(abs(t2 - be) / risk, 2)
+                c.execute("UPDATE runner SET status='t2',r=? WHERE id=?", (rr, rid))
+                out.append(f"🟢 النصف الباقي — {nm}\n{at} الرياض\n\n"
+                           f"السعر بلغ الهدف الثاني {px(t2, cfg)}.\n"
+                           f"أغلق الباقي · +{rr/2:.2f}R على النصف.")
+                break
+    c.commit()
+    for a in out:
         try: say(a)
         except Exception: pass
 
@@ -756,9 +858,12 @@ def sig_text(s, l, ts, cfg):
     ar = "شراء" if s["side"] == "buy" else "بيع"
     return (f"🟢 إشارة {ar} — {cfg['name']}\n"
             f"{now_riy(ts)} الرياض · جلسة {session_name(ts)}\n\n"
-            f"الدخول: {s['entry']:,.1f} (ارتداد على المستوى المكسور)\n"
-            f"الستوب: {s['stop']:,.1f}  ({s['risk']} نقطة)\n"
-            f"الأهداف: {s['targets'][0]:,.1f} · {s['targets'][1]:,.1f} · {s['targets'][2]:,.1f}\n"
+            f"الدخول: {px(s['entry'], cfg)} (ارتداد على المستوى المكسور)\n"
+            f"الستوب: {px(s['stop'], cfg)}  ({s['risk']} نقطة)\n"
+            f"الهدف الأول: {px(s['targets'][0], cfg)} — أغلق النصف وانقل "
+            f"الستوب للتعادل\n"
+            f"الهدف الثاني: {px(s['targets'][1], cfg)} (النصف الباقي)\n"
+            f"الثالث: {px(s['targets'][2], cfg)}\n"
             f"R:R للهدف الأول 1:{s['rr']}\n\n"
             f"السبب: كسر {'VAH' if s['side']=='buy' else 'VAL'} {s['level']:,.1f} "
             f"بإغلاق، دلتا {s['delta']*100:+.1f}%\n"
@@ -766,7 +871,8 @@ def sig_text(s, l, ts, cfg):
             f"المدى (8 شمعات): {s['range']}\n\n"
             f"يوم {l['day']}: {l['sent']+1}/{cfg['max']} · المحقق {l['r']:+.2f}R"
             + (f" · {l['pts']:+.0f} نقطة" if cfg.get('pts') else "") + "\n"
-            f"الستوب إلزامي. النظام لا ينفّذ — القرار لك.")
+            f"الستوب إلزامي. النظام لا ينفّذ — القرار لك."
+            + offset_warn(cfg))
 
 
 def hour_text(ctx, why, l, bad, ts, cfg):
@@ -932,8 +1038,32 @@ def eod_text(c, ts, inst, cfg):
                   f"الصافي: {r_sum:+.2f}R"
                   + (f" · {led['pts']:+.0f} نقطة من {cfg['pts']}"
                      if cfg.get("pts") else "")]
+    lines += runner_lines(c, inst)
     lines += ["", "العدادات صُفِّرت — يوم جديد يبدأ مع افتتاح لندن."]
     return "\n".join(lines)
+
+
+def runner_lines(c, inst):
+    """حكم الخروج الجزئي بالأرقام، لا بالإحساس.
+
+    يقارن القاعدة المختبرة (خروج كامل عند T1 = +2R) بالخروج الجزئي
+    (نصف عند T1 + نصف إلى التعادل أو T2). لا يُعتدّ بالنتيجة قبل 30 حالة.
+    """
+    rows = c.execute("SELECT status, r FROM runner WHERE inst=? AND status<>'open'",
+                     (inst,)).fetchall()
+    n = len(rows)
+    if not n:
+        return []
+    be = sum(1 for x in rows if x[0] == "be")
+    full = 2.0 * n                       # القاعدة المختبرة
+    part = sum(1.0 + (x[1] or 0) / 2 for x in rows)   # نصف + نصف
+    d = (part - full) / n
+    v = ("الفرق لا يُعتدّ به قبل 30 حالة" if n < 30
+         else ("الخروج الجزئي أفضل — يُرفع للقاعدة" if d > 0
+               else "الخروج الجزئي أسوأ — يُحذف"))
+    return ["", f"الخروج الجزئي: {n} حالة · رجعت للتعادل {be}",
+            f"  كامل عند T1 {full/n:+.2f}R/حالة · جزئي {part/n:+.2f}R/حالة "
+            f"({d:+.2f}R)", f"  {v}"]
 
 def main():
     c = db(); cd = CD()
